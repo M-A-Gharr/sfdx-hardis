@@ -1,0 +1,230 @@
+/* jscpd:ignore-start */
+import { SfCommand, Flags, requiredOrgFlagWithDeprecations } from '@salesforce/sf-plugins-core';
+import { Messages } from '@salesforce/core';
+import { AnyJson } from '@salesforce/ts-types';
+import c from 'chalk';
+import * as child from 'child_process';
+import fs from 'fs-extra';
+import * as path from 'path';
+import { MetadataUtils } from '../../../../../common/metadata-utils/index.js';
+import { ensureGitRepository, execCommand, isMonitoringJob, uxLog } from '../../../../../common/utils/index.js';
+import LegacyApi from '../../diagnose/legacyapi.js';
+import OrgTestApex from '../../test/apex.js';
+import * as util from 'util';
+import { PACKAGE_ROOT_DIR } from '../../../../../settings.js';
+import { CONSTANTS } from '../../../../../config/index.js';
+const exec = util.promisify(child.exec);
+
+Messages.importMessagesDirectoryFromMetaUrl(import.meta.url);
+const messages = Messages.loadMessages('sfdx-hardis', 'org');
+
+export default class DxSources extends SfCommand<any> {
+  public static title = 'Retrieve sfdx sources from org';
+
+  public static description = `
+## Command Behavior
+
+**Retrieves Salesforce metadata from an org into a local directory, primarily for backup and monitoring purposes.**
+
+This command is designed to pull metadata from any Salesforce org, providing a snapshot of its configuration. It's particularly useful in monitoring contexts where you need to track changes in an org's metadata over time.
+
+Key functionalities:
+
+- **Metadata Retrieval:** Connects to a target Salesforce org and retrieves metadata based on a specified \`package.xml\`.
+- **Managed Package Filtering:** By default, it filters out metadata from managed packages to reduce the volume of retrieved data. This can be overridden with the \`--includemanaged\` flag.
+- **Monitoring Integration:** Designed to be used within a monitoring CI/CD job, it performs additional post-retrieval actions like running Apex tests and checking for legacy API usage.
+
+<details markdown="1">
+<summary>Technical explanations</summary>
+
+The command's technical implementation involves:
+
+- **Git Repository Check:** Ensures the current directory is a Git repository and initializes it if necessary.
+- **\`MetadataUtils.retrieveMetadatas\`:** This utility is the core of the retrieval process. It connects to the Salesforce org, retrieves metadata based on the provided \`package.xml\` and filtering options (e.g., \`filterManagedItems\`), and places the retrieved files in a specified folder.
+- **File System Operations:** Uses \`fs-extra\` to manage directories and copy retrieved files to the target folder.
+- **Post-Retrieval Actions (for Monitoring Jobs):** If the command detects it's running within a monitoring CI/CD job (\`isMonitoringJob()\`):
+  - It updates the \`.gitlab-ci.yml\` file if \`AUTO_UPDATE_GITLAB_CI_YML\` is set.
+  - It converts the retrieved metadata into SFDX format using \`sf project convert mdapi\`.
+  - It executes \`sf hardis:org:test:apex\` to run Apex tests.
+  - It executes \`sf hardis:org:diagnose:legacyapi\` to check for legacy API usage.
+  - It logs warnings if post-actions fail or if the monitoring version is deprecated.
+- **Error Handling:** Includes robust error handling for retrieval failures and post-action execution.
+</details>
+`;
+
+  public static examples = [
+    '$ sf hardis:org:retrieve:sources:metadata',
+    '$ SFDX_RETRIEVE_WAIT_MINUTES=200 sf hardis:org:retrieve:sources:metadata',
+  ];
+
+  public static flags: any = {
+    folder: Flags.string({
+      char: 'f',
+      default: '.',
+      description: messages.getMessage('folder'),
+    }),
+    packagexml: Flags.string({
+      char: 'p',
+      description: messages.getMessage('packageXml'),
+    }),
+    includemanaged: Flags.boolean({
+      default: false,
+      description: 'Include items from managed packages',
+    }),
+    instanceurl: Flags.string({
+      char: 'r',
+      description: messages.getMessage('instanceUrl'),
+    }),
+    debug: Flags.boolean({
+      char: 'd',
+      default: false,
+      description: messages.getMessage('debugMode'),
+    }),
+    websocket: Flags.string({
+      description: messages.getMessage('websocket'),
+    }),
+    skipauth: Flags.boolean({
+      description: 'Skip authentication check when a default username is required',
+    }),
+    'target-org': requiredOrgFlagWithDeprecations,
+  };
+
+  // Set this to true if your command requires a project workspace; 'requiresProject' is false by default
+  public static requiresProject = false;
+
+  // Trigger notification(s) to MsTeams channel
+  protected static triggerNotification = true;
+
+  protected debugMode = false;
+
+  /* jscpd:ignore-end */
+
+  public async run(): Promise<AnyJson> {
+    const { flags } = await this.parse(DxSources);
+    const folder = path.resolve(flags.folder || '.');
+    const packageXml = path.resolve(flags.packagexml || 'package.xml');
+    const includeManaged = flags.includemanaged || false;
+    this.debugMode = flags.debug || false;
+
+    // Check required pre-requisites
+    await ensureGitRepository({ init: true });
+    const isMonitoring = await isMonitoringJob();
+
+    // Retrieve metadatas
+    let message = '';
+    try {
+      const filterManagedItems = includeManaged === false;
+      await MetadataUtils.retrieveMetadatas(
+        packageXml,
+        folder,
+        false,
+        [],
+        { filterManagedItems: filterManagedItems },
+        this,
+        flags['target-org'].getUsername(),
+        this.debugMode
+      );
+
+      // Copy to destination
+      await fs.copy(path.join(folder, 'unpackaged'), path.resolve(folder));
+      // Remove temporary files
+      await fs.rm(path.join(folder, 'unpackaged'), { recursive: true });
+
+      message = `[sfdx-hardis] Successfully retrieved metadatas in ${folder}`;
+      uxLog("other", this, message);
+    } catch (e) {
+      if (!isMonitoring) {
+        throw e;
+      }
+      message = '[sfdx-hardis] Error retrieving metadatas';
+    }
+
+    // Post actions for monitoring CI job
+
+    if (isMonitoring) {
+      try {
+        return await this.processPostActions(message, flags);
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      } catch (e) {
+        uxLog("warning", this, c.yellow('Post actions have failed !'));
+      }
+      uxLog(
+        "warning",
+        this,
+        c.yellow(c.bold('This version of sfdx-hardis monitoring is deprecated and will not be maintained anymore'))
+      );
+      uxLog("warning", this, c.yellow(c.bold('Switch to new sfdx-hardis monitoring that is enhanced !')));
+      uxLog("warning", this, c.yellow(c.bold(`Info: ${CONSTANTS.DOC_URL_ROOT}/salesforce-monitoring-home/`)));
+    }
+
+    return { orgId: flags['target-org'].getOrgId(), outputString: message };
+  }
+
+  private async processPostActions(message, flags) {
+    uxLog("action", this, c.cyan('Monitoring repo detected'));
+
+    // Update default .gitlab-ci.yml within the monitoring repo
+    const localGitlabCiFile = path.join(process.cwd(), '.gitlab-ci.yml');
+    if (fs.existsSync(localGitlabCiFile) && process.env?.AUTO_UPDATE_GITLAB_CI_YML) {
+      const localGitlabCiContent = await fs.readFile(localGitlabCiFile, 'utf8');
+      const latestGitlabCiFile = path.join(PACKAGE_ROOT_DIR, 'defaults/monitoring/.gitlab-ci.yml');
+      const latestGitlabCiContent = await fs.readFile(latestGitlabCiFile, 'utf8');
+      if (localGitlabCiContent !== latestGitlabCiContent) {
+        await fs.writeFile(localGitlabCiFile, latestGitlabCiContent);
+        uxLog("action", this, c.cyan('Updated .gitlab-ci.yml file'));
+      }
+    }
+
+    // Also trace updates with sfdx sources, for better readability
+    uxLog("action", this, c.cyan('Convert into sfdx format...'));
+    if (fs.existsSync('metadatas')) {
+      // Create sfdx project if not existing yet
+      if (!fs.existsSync('sfdx-project')) {
+        const createCommand = 'sf project generate' + ` --name "sfdx-project"`;
+        uxLog("action", this, c.cyan('Creating sfdx-project...'));
+        await execCommand(createCommand, this, {
+          output: true,
+          fail: true,
+          debug: this.debugMode,
+        });
+      }
+      // Convert metadatas into sfdx sources
+      const mdapiConvertCommand = `sf project convert mdapi --root-dir "../metadatas"`;
+      uxLog("action", this, c.cyan('Converting metadata to source formation into sfdx-project...'));
+      uxLog("other", this, `[command] ${c.bold(c.grey(mdapiConvertCommand))}`);
+      const prevCwd = process.cwd();
+      process.chdir(path.join(process.cwd(), './sfdx-project'));
+      try {
+        const convertRes = await exec(mdapiConvertCommand, {
+          maxBuffer: 10000 * 10000,
+        });
+        uxLog("other", this, convertRes.stdout + convertRes.stderr);
+      } catch (e) {
+        uxLog("warning", this, c.yellow('Error while converting metadatas to sources:\n' + (e as Error).message));
+      }
+      process.chdir(prevCwd);
+    }
+
+    let orgTestRes: any = null;
+    let legacyApiRes: any = null;
+    const prevExitCode = process.exitCode || 0;
+    try {
+      // Run test classes
+      uxLog("action", this, c.cyan('Running Apex tests...'));
+      orgTestRes = await new OrgTestApex([], this.config)._run();
+
+      // Check usage of Legacy API versions
+      uxLog("action", this, c.cyan('Running Legacy API Use checks...'));
+      legacyApiRes = await new LegacyApi([], this.config)._run();
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    } catch (e) {
+      uxLog("warning", this, c.yellow('Issues found when running Apex tests or Legacy API, please check messages'));
+    }
+    process.exitCode = prevExitCode;
+
+    // Delete report files
+    //const reportFiles = await glob("**/hardis-report/**", { cwd: process.cwd() });
+    //reportFiles.map(async (file) => await fs.remove(file));
+    return { orgId: flags['target-org'].getOrgId(), outputString: message, orgTestRes, legacyApiRes };
+  }
+}

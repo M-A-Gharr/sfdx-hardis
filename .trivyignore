@@ -1,0 +1,75 @@
+# @babel/runtime https://avd.aquasec.com/nvd/2025/cve-2025-27789/
+# Risk: High CPU Usage, not risky for sfdx-hardis
+CVE-2025-27789
+
+# @octokit/plugin-paginate-rest  https://avd.aquasec.com/nvd/cve-2025-25288
+# Risk: High CPU Usage, not risky for sfdx-hardis
+CVE-2025-25288
+
+# @octokit/request https://avd.aquasec.com/nvd/cve-2025-25290
+# Risk: High CPU Usage, not risky for sfdx-hardis
+CVE-2025-25290
+
+# @octokit/request-error https://avd.aquasec.com/nvd/2025/cve-2025-25289/
+# Risk: High CPU Usage, not risky for sfdx-hardis
+CVE-2025-25289
+
+# tar-fs https://avd.aquasec.com/nvd/2024/cve-2024-12905/
+# Risk:  Improper Limitation of a Pathname to a Restricted Directory (Path Traversal), not risky for sfdx-hardis
+CVE-2024-12905
+
+# tar-fs https://avd.aquasec.com/nvd/cve-2025-48387
+# Risk : Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal'), not risky for sfdx-hardis
+CVE-2025-48387
+
+# cross-spawn https://avd.aquasec.com/nvd/cve-2024-21538
+# Risk: Denial of Service, not risky for sfdx-hardis
+CVE-2024-21538
+
+# marked https://avd.aquasec.com/nvd/cve-2022-21680
+# Risk: Denial of Service, not risky for sfdx-hardis
+CVE-2022-21680
+
+# marked https://avd.aquasec.com/nvd/cve-2022-21681
+# Risk: Denial of Service, not risky for sfdx-hardis
+CVE-2022-21681
+
+# sqlite-libs https://avd.aquasec.com/nvd/2025/cve-2025-29087/
+# Risk: Memory leak, not risky for sfdx-hardis
+CVE-2025-29087
+
+# lodash.template https://avd.aquasec.com/nvd/cve-2021-23337 
+# Risk: Command injection via template. The dependency is located within Core SF Cli library (.local/share/sf/node_modules/lodash.template/package.json)
+# so is applicable to all uses of Salesforce CLI, with or without sfdx-hardis
+# Let's trust core Salesforce team to have assessed that this CVE is not risky in their context, otherwise it would mean that all uses of Salesforce CLI in the world would be a security risk ^^
+CVE-2021-23337
+
+# form-data https://avd.aquasec.com/nvd/cve-2025-7783
+# Use of Insufficiently Random Values vulnerability: HTTP Parameter Pollution (HPP), not risky for sfdx-hardis uses as it is not used as a HTTP server
+CVE-2025-7783
+
+# sqlite https://avd.aquasec.com/nvd/cve-2025-6965
+# Integer Truncation in SQLite, not risky for sfdx-hardis use
+CVE-2025-6965
+
+# sha.js https://avd.aquasec.com/nvd/cve-2025-9288
+# Missing type checks leading to hash rewind, located in @salesforce/cli so they'll fix that soon
+CVE-2025-9288
+
+# tar-fs https://avd.aquasec.com/nvd/cve-2025-59343
+# tar-fs symlink validation bypass, located in @salesforce/cli so they'll fix that soon
+CVE-2025-59343
+
+# fast-redact https://avd.aquasec.com/nvd/cve-2025-57319 
+# fast-redact prototype pollution: Low security, harmless for sfdx-hardis use
+CVE-2025-57319
+
+# Dockerfile https://avd.aquasec.com/misconfig/ds002
+# Image using root user, that's ok as we are using it in CI/CD jobs containers, so not risky for sfdx-hardis
+DS002
+
+# Dockerfile https://avd.aquasec.com/misconfig/ds026
+# No HEALTHCHECK defined, that's ok as our container live only the time of the job, so not risky for sfdx-hardis
+DS026
+
+

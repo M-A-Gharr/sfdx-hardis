@@ -1,0 +1,268 @@
+/* jscpd:ignore-start */
+import { SfCommand, Flags } from '@salesforce/sf-plugins-core';
+import { Messages } from '@salesforce/core';
+import { AnyJson } from '@salesforce/ts-types';
+import c from 'chalk';
+import { assert } from 'console';
+import fs from 'fs-extra';
+import moment from 'moment';
+import * as os from 'os';
+import * as path from 'path';
+import { clearCache } from '../../../common/cache/index.js';
+import { elapseEnd, elapseStart, execSfdxJson, getCurrentGitBranch, uxLog } from '../../../common/utils/index.js';
+import {
+  initApexScripts,
+  initOrgData,
+  initPermissionSetAssignments,
+  promptUserEmail,
+} from '../../../common/utils/orgUtils.js';
+import { WebSocketClient } from '../../../common/websocketClient.js';
+import { getConfig } from '../../../config/index.js';
+
+Messages.importMessagesDirectoryFromMetaUrl(import.meta.url);
+const messages = Messages.loadMessages('sfdx-hardis', 'org');
+
+export default class SandboxCreate extends SfCommand<any> {
+  public static title = 'Create sandbox org';
+
+  public static description = `
+## Command Behavior
+
+**Creates and initializes a Salesforce sandbox org.**
+
+This command automates the process of provisioning a new sandbox environment, making it ready for development or testing. It handles various aspects of sandbox creation and initial setup, reducing manual effort and ensuring consistency.
+
+Key functionalities:
+
+- **Sandbox Definition:** Uses a \`project-sandbox-def.json\` file (if present in \`config/\`) to define sandbox properties like name, description, license type, and source sandbox. If not provided, it uses default values.
+- **Dynamic Naming:** Generates a unique sandbox alias based on the current username, Git branch, and a timestamp.
+- **Sandbox Creation:** Executes the Salesforce CLI command to create the sandbox, including setting it as the default org and waiting for its completion.
+- **User Update:** Updates the main sandbox user's details (e.g., Last Name, First Name) and can fix country values or marketing user permissions if needed.
+- **Initialization Scripts:** Runs predefined Apex scripts, assigns permission sets, and imports initial data into the newly created sandbox, based on configurations in your project.
+- **Error Handling:** Provides detailed error messages for common sandbox creation issues, including Salesforce-specific errors.
+
+<details markdown="1">
+<summary>Technical explanations</summary>
+
+The command's technical implementation involves:
+
+- **Configuration Loading:** It loads project and user configurations using \`getConfig\` to retrieve settings like \`projectName\`, \`devHubAlias\`, and \`userEmail\`.
+- **Git Integration:** Retrieves the current Git branch name using \`getCurrentGitBranch\` to inform sandbox naming.
+- **File System Operations:** Uses \`fs-extra\` to manage sandbox definition files (reading \`project-sandbox-def.json\`, writing a user-specific definition file) and temporary directories.
+- **Salesforce CLI Execution:** Executes Salesforce CLI commands (\`sf org create sandbox\`, \`sf data get record\`, \`sf data update record\`, \`sf org open\`) using \`execSfdxJson\` for sandbox creation, user updates, and opening the org in a browser.
+- **Cache Management:** Clears the Salesforce CLI org list cache (\`clearCache('sf org list')\`) to ensure the newly created sandbox is immediately recognized.
+- **Initialization Utilities:** Calls a suite of utility functions (\`initPermissionSetAssignments\`, \`initApexScripts\`, \`initOrgData\`) to perform post-creation setup tasks.
+- **Error Assertions:** Uses \`assert\` to check the success of Salesforce CLI commands and provides custom error messages for better debugging.
+- **WebSocket Communication:** Uses \`WebSocketClient.sendRefreshStatusMessage\` to notify connected VS Code clients about the new sandbox.
+- **Required Plugin Check:** Explicitly lists \`sfdmu\` as a required plugin, indicating its role in data initialization.
+</details>
+`;
+
+  public static examples = ['$ sf hardis:org:create'];
+
+  // public static args = [{name: 'file'}];
+
+  public static flags: any = {
+    debug: Flags.boolean({
+      char: 'd',
+      default: false,
+      description: messages.getMessage('debugMode'),
+    }),
+    websocket: Flags.string({
+      description: messages.getMessage('websocket'),
+    }),
+    skipauth: Flags.boolean({
+      description: 'Skip authentication check when a default username is required',
+    }),
+  };
+  protected static supportsDevhubUsername = true;
+
+  // Set this to true if your command requires a project workspace; 'requiresProject' is false by default
+  public static requiresProject = true;
+
+  // List required plugins, their presence will be tested before running the command
+  protected static requiresSfdxPlugins = ['sfdmu'];
+
+  /* jscpd:ignore-end */
+
+  protected debugMode = false;
+  protected configInfo: any;
+  protected devHubAlias: string;
+  protected sandboxOrgAlias: string;
+  protected userEmail: string;
+
+  protected gitBranch: string;
+  protected projectSandboxDef: any;
+  protected sandboxOrgInfo: any;
+  protected sandboxOrgUsername: string;
+  protected sandboxOrgSfdxAuthUrl: string;
+  protected authFileJson: any;
+  protected projectName: string;
+  protected sandboxOrgFromPool: any;
+
+  public async run(): Promise<AnyJson> {
+    const { flags } = await this.parse(SandboxCreate);
+    this.debugMode = flags.debug || false;
+    elapseStart(`Create and initialize sandbox org`);
+    await this.initConfig();
+    await this.createSandboxOrg();
+    try {
+      await this.updateSandboxOrgUser();
+      await initPermissionSetAssignments(this.configInfo.initPermissionSets || [], this.sandboxOrgUsername);
+      await initApexScripts(this.configInfo.sandboxOrgInitApexScripts || [], this.sandboxOrgUsername);
+      await initOrgData(path.join('.', 'scripts', 'data', 'SandboxInit'), this.sandboxOrgUsername);
+    } catch (e) {
+      elapseEnd(`Create and initialize sandbox org`);
+      uxLog("log", this, c.grey('Error: ' + (e as Error).message + '\n' + (e as Error).stack));
+      throw e;
+    }
+    elapseEnd(`Create and initialize sandbox org`);
+    // Return an object to be displayed with --json
+    return {
+      status: 0,
+      sandboxOrgAlias: this.sandboxOrgAlias,
+      sandboxOrgInfo: this.sandboxOrgInfo,
+      sandboxOrgUsername: this.sandboxOrgUsername,
+      sandboxOrgSfdxAuthUrl: this.sandboxOrgSfdxAuthUrl,
+      authFileJson: this.authFileJson,
+      outputString: 'Created and initialized sandbox org',
+    };
+  }
+
+  // Initialize configuration from .sfdx-hardis.yml + .gitbranch.sfdx-hardis.yml + .username.sfdx-hardis.yml
+  public async initConfig() {
+    this.configInfo = await getConfig('user');
+    this.gitBranch = (await getCurrentGitBranch({ formatted: true })) || '';
+    const newSandboxName =
+      os.userInfo().username +
+      '-' +
+      (this.gitBranch.split('/').pop() || '').slice(0, 15) +
+      '_' +
+      moment().format('YYYYMMDD_hhmm');
+    this.sandboxOrgAlias = process.env.SANDBOX_ORG_ALIAS || newSandboxName;
+
+    this.projectName = process.env.PROJECT_NAME || this.configInfo.projectName;
+    this.devHubAlias = process.env.DEVHUB_ALIAS || this.configInfo.devHubAlias;
+
+    this.userEmail = process.env.USER_EMAIL || process.env.GITLAB_USER_EMAIL || this.configInfo.userEmail;
+
+    // If not found, prompt user email and store it in user config file
+    if (this.userEmail == null) {
+      this.userEmail = await promptUserEmail();
+    }
+  }
+
+  // Create a new sandbox org or reuse existing one
+  public async createSandboxOrg() {
+    // Build project-sandbox-def-branch-user.json
+    uxLog("action", this, c.cyan('Building custom project-sandbox-def.json...'));
+    if (fs.existsSync('./config/project-sandbox-def.json')) {
+      this.projectSandboxDef = JSON.parse(fs.readFileSync('./config/project-sandbox-def.json', 'utf-8'));
+    } else {
+      uxLog("warning", this, c.yellow(`Default values used: you may define a file ${c.bold('config/project-sandbox-def.json')}`));
+      this.projectSandboxDef = {
+        sandboxName: '',
+        description: 'SFDX Hardis developer sandbox',
+        licenseType: 'Developer',
+        sourceSandbox: '',
+      };
+    }
+    this.projectSandboxDef.sandboxName = os.userInfo().username.substring(0, 10);
+    const projectSandboxDefLocal = `./config/user/project-sandbox-def-${this.sandboxOrgAlias}.json`;
+    await fs.ensureDir(path.dirname(projectSandboxDefLocal));
+    await fs.writeFile(projectSandboxDefLocal, JSON.stringify(this.projectSandboxDef, null, 2));
+
+    // Fix @salesforce/cli bug: remove shape.zip if found
+    const tmpShapeFolder = path.join(os.tmpdir(), 'shape');
+    if (fs.existsSync(tmpShapeFolder)) {
+      await fs.remove(tmpShapeFolder);
+      uxLog("log", this, c.grey('Deleted ' + tmpShapeFolder));
+    }
+
+    // Create new sandbox org
+    uxLog("action", this, c.cyan('Creating new sandbox org...'));
+    const waitTime = process.env.SANDBOX_ORG_WAIT || '60';
+    const createCommand =
+      'sf org create sandbox --set-default ' +
+      `--definition-file ${projectSandboxDefLocal} ` +
+      `--alias ${this.sandboxOrgAlias} ` +
+      `--wait ${waitTime} ` +
+      `--target-org ${this.devHubAlias} `;
+    const createResult = await execSfdxJson(createCommand, this, {
+      fail: false,
+      output: false,
+      debug: this.debugMode,
+    });
+    await clearCache('sf org list');
+    assert(createResult.status === 0 && createResult.result, this.buildSandboxCreateErrorMessage(createResult));
+    this.sandboxOrgInfo = createResult.result;
+    this.sandboxOrgUsername = this.sandboxOrgInfo.username;
+    // Trigger a status refresh on VS Code WebSocket Client
+    WebSocketClient.sendRefreshStatusMessage();
+
+    // Open sandbox org for user if not in CI
+    await execSfdxJson('sf org open', this, {
+      fail: true,
+      output: false,
+      debug: this.debugMode,
+    });
+    uxLog(
+      "action",
+      this,
+      c.cyan(`Created sandbox org ${c.green(this.sandboxOrgAlias)} with user ${c.green(this.sandboxOrgUsername)}`)
+    );
+  }
+
+  public buildSandboxCreateErrorMessage(createResult) {
+    if (createResult.status === 0 && createResult.result) {
+      return c.green('Sandbox create OK');
+    } else if (
+      createResult.status === 1 &&
+      createResult.errorMessage.includes('Socket timeout occurred while listening for results')
+    ) {
+      return c.red(
+        `[sfdx-hardis] Error creating sandbox org. ${c.bold(
+          'This is probably a Salesforce error, try again manually or launch again CI job'
+        )}\n${JSON.stringify(createResult, null, 2)}`
+      );
+    }
+    return c.red(
+      `[sfdx-hardis] Error creating sandbox org. Maybe try ${c.yellow(
+        c.bold('sf hardis:sandbox:create --forcenew')
+      )} ?\n${JSON.stringify(createResult, null, 2)}`
+    );
+  }
+
+  // Update sandbox org user
+  public async updateSandboxOrgUser() {
+    const config = await getConfig('user');
+    // Update sandbox org main user
+    uxLog("action", this, c.cyan('Update / fix sandbox org user ' + this.sandboxOrgUsername));
+    const userQueryCommand = `sf data get record --sobject User --where "Username=${this.sandboxOrgUsername}" --target-org ${this.sandboxOrgAlias}`;
+    const userQueryRes = await execSfdxJson(userQueryCommand, this, {
+      fail: true,
+      output: false,
+      debug: this.debugMode,
+    });
+    let updatedUserValues = `LastName='SFDX-HARDIS' FirstName='Sandbox Org'`;
+    // Fix country value is State & Country picklist activated
+    /* jscpd:ignore-start */
+    if (
+      (this.projectSandboxDef.features || []).includes('StateAndCountryPicklist') &&
+      userQueryRes.result.CountryCode == null
+    ) {
+      updatedUserValues += ` CountryCode='${config.defaultCountryCode || 'FR'}' Country='${config.defaultCountry || 'France'
+        }'`;
+    }
+    if (
+      (this.projectSandboxDef.features || []).includes('MarketingUser') &&
+      userQueryRes.result.UserPermissionsMarketingUser === false
+    ) {
+      // Make sure MarketingUser is checked on sandbox org user if it is supposed to be
+      updatedUserValues += ' UserPermissionsMarketingUser=true';
+    }
+    const userUpdateCommand = `sf data update record --sobject User --record-id ${userQueryRes.result.Id} --values "${updatedUserValues}" --target-org ${this.sandboxOrgAlias}`;
+    await execSfdxJson(userUpdateCommand, this, { fail: false, output: true, debug: this.debugMode });
+    /* jscpd:ignore-end */
+  }
+}
