@@ -1,100 +1,105 @@
-import fs from "fs-extra";
-import path from "path";
-import Handlebars from "handlebars";
+import crypto from "crypto";
 import { PromptTemplate } from "../aiProvider/promptTemplates.js";
-import { VfParser, VfPageMetadata } from "../vfScripts/vfParser.js";
-import { parseApexClassFile } from "../vfScripts/apexParser.js";
 import { DocBuilderRoot } from "./docBuilderRoot.js";
-import promptDescribeVf from "../aiProvider/promptTemplates/PROMPT_DESCRIBE_VF.js";
+import { getCache, setCache } from "../cache/index.js";
 
 export class DocBuilderVf extends DocBuilderRoot {
-  public docType = "Vf";
-  public placeholder = "<!-- VF description -->";
+
+  public docType = "Visualforce";
   public promptKey: PromptTemplate = "PROMPT_DESCRIBE_VF";
-  public xmlRootKey = "";
-  public docsSection = "vf";
+  public placeholder = "<!-- VF description -->";
 
-  private vfParser: VfParser;
-  private template: Handlebars.TemplateDelegate;
+  private _sourceHash: string | null = null;
 
-  constructor(templatePath: string) {
-    super("", "", "", {});
-    this.vfParser = new VfParser();
-
-    if (!fs.existsSync(templatePath)) {
-      throw new Error(`Visualforce template not found: ${templatePath}`);
-    }
-    const templateContent = fs.readFileSync(templatePath, "utf-8");
-    this.template = Handlebars.compile(templateContent, { noEscape: true });
-    Handlebars.registerHelper("join", (arr: string[], sep: string) => arr?.join(sep));
+  constructor(
+    public metadataName: string,
+    public source: string,
+    public markdownFile: string,
+    public variables: Record<string, any> = {}
+  ) {
+    super(metadataName, source, markdownFile, variables);
   }
 
-  /** Generate Markdown for a VF page, optional AI enrichment */
-  public async buildInitialMarkdown(filePath: string, apexDir: string, aiProvider?: any): Promise<string> {
-    const pageMetadata: VfPageMetadata = this.vfParser.parseVisualforcePage(filePath, apexDir);
-    this.metadataName = pageMetadata.name;
-    this.additionalVariables = { VF_PATH: filePath };
+  /** Compute a hash of the VF source to detect changes */
+  public get sourceHash(): string {
+    if (!this._sourceHash) {
+      this._sourceHash = crypto
+        .createHash("md5")
+        .update(this.source || "")
+        .digest("hex");
+    }
+    return this._sourceHash;
+  }
 
-    // --- Extract Apex controller code for AI ---
-    let apexCode = "";
-    if (pageMetadata.controller && pageMetadata.controller !== "UnknownController") {
-      const apexInfo = parseApexClassFile(apexDir, pageMetadata.controller);
-      if (apexInfo) {
-        apexCode = apexInfo.methods.map(m => `// ${m.name}(${m.parameters}) : ${m.type}`).join("\n");
+  /** Build initial markdown lines (before AI description) */
+  public async buildInitialMarkdownLines(): Promise<string[]> {
+    return [
+      `## ${this.metadataName}`,
+      '',
+      '<!-- VF description -->',
+      '',
+      '## Visualforce Source',
+      '```xml',
+      this.source,
+      '```',
+      '',
+    ];
+  }
+
+  /** Main function to generate the AI description with caching */
+  public async completeDocWithAiDescription(): Promise<string> {
+    const cacheKey = `vf-${this.metadataName}-${this.sourceHash}`;
+
+    try {
+      // 1️⃣ Check cache first
+      const cached = await getCache(cacheKey, null);
+      if (cached) {
+        this.markdownDoc = cached;
+        return this.markdownDoc; // Use cached markdown as-is
       }
-    }
 
-    // --- Optional AI enrichment ---
-    if (aiProvider) {
-      try {
-        const vfCode = await fs.readFile(filePath, "utf-8");
-        const aiResult = await aiProvider.generateDescription({
-          promptTemplate: promptDescribeVf,
-          variables: { VF_NAME: pageMetadata.name, VF_CODE: vfCode, VF_CONTROLLER: apexCode }
-        });
+      // 2️⃣ Call AI if no cache
+      this.markdownDoc = await super.completeDocWithAiDescription();
 
-        if (aiResult) {
-          pageMetadata.overview = aiResult.overview;
-          pageMetadata.purpose = aiResult.purpose;
-          pageMetadata.keyFunctions = aiResult.keyFunctions || [];
-          pageMetadata.interactions = aiResult.interactions || [];
-          pageMetadata.properties = aiResult.properties || pageMetadata.properties;
-          pageMetadata.methods = aiResult.methods || pageMetadata.methods;
-        }
-      } catch (err: any) {
-        console.warn(`⚠️ AI enrichment failed for ${pageMetadata.name}: ${err.message}`);
+      // 3️⃣ Save AI result to cache
+      await setCache(cacheKey, this.markdownDoc);
+
+      return this.markdownDoc;
+
+    } catch (err: any) {
+      console.warn(`AI generation failed for VF page ${this.metadataName}:`, err.message);
+
+      // 4️⃣ Fallback: use cache if exists
+      const cached = await getCache(cacheKey, null);
+      if (cached) {
+        this.markdownDoc = cached;
+        return this.markdownDoc;
       }
-    }
 
-    return this.buildMarkdown(pageMetadata);
+      // 5️⃣ Final fallback: initial markdown skeleton
+      const lines = await this.buildInitialMarkdownLines();
+      this.markdownDoc = lines.join("\n");
+      return this.markdownDoc;
+    }
   }
 
-  /** Build Markdown from template + metadata */
-  private buildMarkdown(metadata: VfPageMetadata): string {
-    let mdContent = this.template(metadata);
+  /** Build the index table for navigation */
+  public static buildIndexTable(prefix: string, vfDescriptions: any[], filterObject: string | null = null) {
+    const filtered = filterObject ? vfDescriptions.filter(vf => vf.impactedObjects?.includes(filterObject)) : vfDescriptions;
+    if (filtered.length === 0) return [];
 
-    if (!mdContent.includes("keyFunctions") && metadata.keyFunctions?.length) {
-      mdContent += "\n\n## Key Functions\n" + metadata.keyFunctions.map(k => `- ${k}`).join("\n");
+    const lines: string[] = [];
+    lines.push(...[
+      filterObject ? "## Related Visualforce Pages" : "## Visualforce Pages",
+      "",
+      "| Visualforce Page |",
+      "| :---- |"
+    ]);
+    for (const vf of filtered) {
+      const pageCell = `[${vf.name}](${prefix}${vf.name}.md)`;
+      lines.push(`| ${pageCell} |`);
     }
-    if (!mdContent.includes("interactions") && metadata.interactions?.length) {
-      mdContent += "\n\n## Interactions\n" + metadata.interactions.map(i => `- ${i}`).join("\n");
-    }
-
-    return mdContent;
-  }
-
-  /** Utility to build an index page for all VF pages */
-  public static async buildIndex(pages: VfPageMetadata[], outputRoot: string, footer: string) {
-    const indexFile = path.join(outputRoot, "vf", "index.md");
-    const lines = ["# Visualforce Pages\n"];
-    for (const page of pages) {
-      lines.push(`- [${page.name}](./${page.name}.md): ${page.overview || ""}`);
-    }
-    fs.ensureDirSync(path.join(outputRoot, "vf"));
-    fs.writeFileSync(indexFile, lines.join("\n") + `\n\n${footer}`, "utf-8");
-  }
-
-  public parsePage(filePath: string, apexDir?: string): VfPageMetadata {
-    return this.vfParser.parseVisualforcePage(filePath, apexDir);
+    lines.push("");
+    return lines;
   }
 }

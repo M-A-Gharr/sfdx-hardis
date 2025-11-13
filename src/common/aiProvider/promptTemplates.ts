@@ -120,5 +120,3 @@ export function buildPromptFromTemplate(template: PromptTemplate, variables: obj
 
   return prompt;
 }
-
-

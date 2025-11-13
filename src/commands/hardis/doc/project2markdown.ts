@@ -15,10 +15,9 @@ import { bool2emoji, createTempDir, execCommand, execSfdxJson, filterPackageXml,
 import { CONSTANTS, getConfig } from '../../../config/index.js';
 import { listMajorOrgs } from '../../../common/utils/orgConfigUtils.js';
 import { glob } from 'glob';
-import { GLOB_IGNORE_PATTERNS, listApexFiles, listFlowFiles, listPageFiles, returnApexType } from '../../../common/utils/projectUtils.js';
+import { GLOB_IGNORE_PATTERNS, listApexFiles, listFlowFiles, listVfFiles, listPageFiles, returnApexType } from '../../../common/utils/projectUtils.js';
 import { generateFlowMarkdownFile, generateHistoryDiffMarkdown, generateMarkdownFileWithMermaid } from '../../../common/utils/mermaidUtils.js';
 import { MetadataUtils } from '../../../common/metadata-utils/index.js';
-import type { VfPageMetadata } from "../../../common/vfScripts/vfParser.js";
 import { PACKAGE_ROOT_DIR } from '../../../settings.js';
 import { BranchStrategyMermaidBuilder } from '../../../common/utils/branchStrategyMermaidBuilder.js';
 import { prettifyFieldName } from '../../../common/utils/flowVisualiser/nodeFormatUtils.js';
@@ -206,7 +205,6 @@ ${this.htmlInstructions}
   protected objectFiles: string[];
   protected allObjectsNames: string[];
   protected tempDir: string;
-  private aiProvider?: any;
   protected projectRoot?: string;
   /* jscpd:ignore-end */
 
@@ -1628,55 +1626,52 @@ ${Project2Markdown.htmlInstructions}
 
     const projectRoot = this.projectRoot || process.cwd();
     const outputRoot = this.outputMarkdownRoot;
-    const templatePath = path.join(projectRoot, "templates", "visualforce-page.hbs");
-    const pagesDir = path.join(projectRoot, "force-app", "main", "default", "pages");
 
-    if (!(await fs.pathExists(pagesDir))) {
-      uxLog("log", this, c.yellow("No Visualforce pages directory found."));
-      return;
-    }
-
-    const vfBuilder = new DocBuilderVf(templatePath);
-
-    const pageFiles = (await fs.readdir(pagesDir))
-      .filter(f => f.endsWith(".page"))
-      .map(f => path.join(pagesDir, f));
-
-    if (pageFiles.length === 0) {
+    // Get all VF files
+    const vfFiles = await listVfFiles(projectRoot);
+    if (vfFiles.length === 0) {
       uxLog("log", this, c.yellow("No Visualforce page files found."));
       return;
     }
 
-    const vfForMenu: Record<string, VfPageMetadata> = {};
-    const descriptions: string[] = [];
+    const vfForMenu: Record<string, any> = {};
+    WebSocketClient.sendProgressStartMessage("Generating Visualforce documentation...", vfFiles.length);
 
-    for (const filePath of pageFiles) {
+    let counter = 0;
+    for (const filePath of vfFiles) {
       try {
-        // Build Markdown with optional AI enrichment
-        const md = await vfBuilder.buildInitialMarkdown(filePath, pagesDir, this.aiProvider);
-
-        const pageMetadata = vfBuilder.metadataName
-          ? vfBuilder.parsePage(filePath, path.join(projectRoot, "force-app", "main", "default", "classes"))
-          : null;
-        if (pageMetadata) {
-          vfForMenu[pageMetadata.name] = pageMetadata;
-          descriptions.push(`${pageMetadata.name}: ${pageMetadata.overview || ""}`);
-        }
-
-        // Write Markdown file
-        const mdFilePath = path.join(outputRoot, "vf", `${path.basename(filePath, ".page")}.md`);
+        const pageName = path.basename(filePath, ".page");
+        const mdFilePath = path.join(outputRoot, "vf", `${pageName}.md`);
         await fs.ensureDir(path.dirname(mdFilePath));
-        await fs.writeFile(mdFilePath, md, "utf-8");
+
+        const pageContent = await fs.readFile(filePath, "utf-8");
+
+        const vfBuilder = new DocBuilderVf(pageName, pageContent, mdFilePath);
+
+        // Generate markdown with cache/AI fallback
+        const mdContent = await vfBuilder.completeDocWithAiDescription();
+
+        await fs.writeFile(mdFilePath, mdContent, "utf-8");
+
+        vfForMenu[pageName] = { name: pageName, path: `vf/${pageName}.md` };
+
+        counter++;
+        WebSocketClient.sendProgressStepMessage(counter, vfFiles.length);
 
       } catch (err: any) {
-        console.warn(`Failed to generate documentation for ${filePath}: ${err.message}`);
+        uxLog("warning", this, c.yellow(`Failed to generate documentation for ${filePath}: ${err.message}`));
       }
     }
 
-    // Build index.md
-    await DocBuilderVf.buildIndex(Object.values(vfForMenu), path.join(outputRoot, "vf"), this.footer);
+    WebSocketClient.sendProgressEndMessage();
 
-    this.vfDescriptions = descriptions;
+    // Build index.md
+    const indexLines = DocBuilderVf.buildIndexTable('vf/', Object.keys(vfForMenu).map(name => ({ name })));
+    indexLines.push('', this.footer);
+    await fs.writeFile(path.join(outputRoot, 'vf', 'index.md'), indexLines.join("\n"), 'utf-8');
+
+    // Update class properties
+    this.vfDescriptions = Object.keys(vfForMenu);
     this.addNavNode("Visualforce Pages", vfForMenu);
 
     uxLog("success", this, c.green("Successfully generated Visualforce documentation."));
@@ -1691,11 +1686,12 @@ ${Project2Markdown.htmlInstructions}
             await generatePdfFileFromMarkdown(mdFilePath);
             uxLog("log", this, c.green(`PDF generated for ${pageName}`));
           } catch (err: any) {
-            console.warn(`Failed to generate PDF for ${pageName}: ${err.message}`);
+            uxLog("warning", this, c.yellow(`Failed to generate PDF for ${pageName}: ${err.message}`));
           }
         }
       }
       uxLog("success", this, c.green("All Visualforce PDFs generated successfully."));
     }
   }
+
 }

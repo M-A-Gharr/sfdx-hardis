@@ -132,6 +132,32 @@ export async function listPageFiles(packageDirs) {
   return pageFiles.sort();
 }
 
+export async function listVfFiles(packageDirs) {
+  const vfFiles: any[] = [];
+  const skippedVf: string[] = [];
+
+  for (const packageDir of packageDirs || []) {
+    const vfMetadatas = await glob("**/*.page", { cwd: packageDir.path, ignore: GLOB_IGNORE_PATTERNS });
+    for (const vfMetadata of vfMetadatas) {
+      const vfFile = path.join(packageDir.path, vfMetadata).replace(/\\/g, '/');
+      if (vfFile.includes('__')) {
+        skippedVf.push(vfFile);
+      } else {
+        vfFiles.push(vfFile);
+      }
+    }
+  }
+
+  if (skippedVf.length > 0) {
+    uxLog("warning", this, c.yellow(`Skipped ${skippedVf.length} managed Visualforce pages:`));
+    for (const skipped of sortCrossPlatform(skippedVf)) {
+      uxLog("warning", this, c.yellow(`  ${skipped}`));
+    }
+  }
+
+  return vfFiles.sort();
+}
+
 export function returnApexType(apexCode: string) {
   const apexContentlower = apexCode.toLowerCase();
   return apexContentlower.includes("@istest(seealldata=true)") ? "Test (See All Data)" :
