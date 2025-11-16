@@ -9,7 +9,6 @@ import { getCache, setCache } from "../cache/index.js";
 import { VfParser, VfParsedInfo } from "../utils/visualForce/vfParser.js";
 import { ApexParser, ApexParsedInfo } from "../utils/visualForce/apexParser.js";
 
-// Define a type for the result of the documentation generation (for `build` method)
 export interface VfDocGenerationResult {
   markdownContent: string;
   shortDescription: string;
