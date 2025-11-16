@@ -53,6 +53,9 @@ export class VfParser {
       const parsedData = VfParser.xmlParser.parse(vfContent);
 
       if (!parsedData || !parsedData['apex:page']) {
+        // If XML parsing fails or is not a VF page, use fallback
+        this._extractBasicVfInfo(vfContent, result); // Use the new shared method
+        this.extractApexExpressions(vfContent, result); // Still need to extract expressions
         return result;
       }
 
@@ -154,9 +157,10 @@ export class VfParser {
         return bCount - aCount;
       });
 
-    } catch (error) {
+    } catch (err: any) {
       console.warn('VF Parser: Error parsing Visualforce content, using fallback extraction');
-      this.fallbackParse(vfContent, result);
+      this._extractBasicVfInfo(vfContent, result); // Use the new shared method
+      this.extractApexExpressions(vfContent, result); // Still need to extract expressions
     }
 
     return result;
@@ -205,8 +209,8 @@ export class VfParser {
     return fragments;
   }
 
-  private static fallbackParse(vfContent: string, result: VfParsedInfo): void {
-    // Fallback parsing using regex for malformed XML
+  // NEW SHARED METHOD
+  public static _extractBasicVfInfo(vfContent: string, result: VfParsedInfo): void {
     const controllerMatch = vfContent.match(/standardController\s*=\s*"([^"]*)"/);
     if (controllerMatch) {
       result.controllerName = controllerMatch[1];
@@ -217,7 +221,6 @@ export class VfParser {
       result.extensionNames = extensionsMatch[1].split(',').map(ext => ext.trim());
     }
 
-    // Extract components using regex
     const componentRegex = /<([a-z]+):([a-zA-Z]+)/g;
     let compMatch;
     while ((compMatch = componentRegex.exec(vfContent)) !== null) {
@@ -227,8 +230,6 @@ export class VfParser {
         attributes: {}
       });
     }
-
-    // Extract expressions
-    this.extractApexExpressions(vfContent, result);
+    // Note: extractApexExpressions is called separately as it might be needed outside this basic parse
   }
 }

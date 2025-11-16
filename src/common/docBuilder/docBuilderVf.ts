@@ -156,26 +156,8 @@ export class DocBuilderVf extends DocBuilderRoot {
       hasStaticResources: false,
       templateFragments: [],
     };
-
-    // Extract basic controller info with simple regex
-    const controllerMatch = content.match(/standardController\s*=\s*"([^"]*)"/);
-    if (controllerMatch) {
-      result.controllerName = controllerMatch[1];
-    }
-
-    const extensionsMatch = content.match(/extensions\s*=\s*"([^"]*)"/);
-    if (extensionsMatch) {
-      result.extensionNames = extensionsMatch[1].split(',').map(ext => ext.trim());
-    }
-
-    // Extract basic component count
-    const componentMatches = content.match(/<([a-z]+):([a-zA-Z]+)/g) || [];
-    result.components = componentMatches.map(comp => ({
-      namespace: comp.split(':')[0].replace('<', ''),
-      name: comp.split(':')[1],
-      attributes: {}
-    }));
-
+    VfParser._extractBasicVfInfo(content, result); // Call the new shared method
+    VfParser['extractApexExpressions'](content, result); // Also extract expressions
     return result;
   }
 
@@ -207,8 +189,8 @@ export class DocBuilderVf extends DocBuilderRoot {
           const apexContent = await fs.readFile(apexFilePath, 'utf-8');
           const parsedInfo = await ApexParser.parse(apexContent, controllerName);
           this.apexParsedInfoMap.set(controllerName, parsedInfo);
-        } catch (error) {
-          console.warn(`Failed to parse Apex class ${controllerName}:`, error);
+        } catch (err: any) {
+          console.warn(`Failed to parse Apex class ${controllerName}:`, err);
         }
       }
     }
