@@ -52,10 +52,11 @@ export class VfParser {
     try {
       const parsedData = VfParser.xmlParser.parse(vfContent);
 
-      if (!parsedData || !parsedData['apex:page']) {
+      if (!parsedData || (typeof parsedData !== 'object') || !parsedData['apex:page']) {
         // If XML parsing fails or is not a VF page, use fallback
-        this._extractBasicVfInfo(vfContent, result); // Use the new shared method
-        this.extractApexExpressions(vfContent, result); // Still need to extract expressions
+        console.warn('VF Parser: XML parsing did not find <apex:page> root, performing basic regex extraction.');
+        VfParser._extractBasicVfInfo(vfContent, result); // Use the new shared method
+        VfParser.extractApexExpressions(vfContent, result); // Still need to extract expressions
         return result;
       }
 
@@ -85,13 +86,14 @@ export class VfParser {
       result.templateFragments = this.extractTemplateFragments(vfContent);
 
       // Helper to traverse nodes and extract info
-      const traverse = (node: any) => {
+      const traverse = (node: any, currentContext: string = 'unknown') => {
         if (typeof node !== 'object' || node === null) return;
 
         for (const key in node) {
           if (!Object.prototype.hasOwnProperty.call(node, key)) continue;
 
           const value = node[key];
+          const newContext = key.startsWith('@_') ? `${currentContext}.${key.substring(2)}` : key;
 
           // Identify VF components (excluding apex:page and text nodes)
           if (key.includes(':') && key !== 'apex:page' && key !== '#text') {
@@ -102,9 +104,11 @@ export class VfParser {
               // Extract attributes
               for (const attrKey in value) {
                 if (attrKey.startsWith('@_')) {
-                  attributes[attrKey.substring(2)] = value[attrKey];
-                } else if (typeof value[attrKey] !== 'object' && !attrKey.includes(':')) {
-                  attributes[attrKey] = value[attrKey];
+                  attributes[attrKey.substring(2)] = String(value[attrKey]);
+                  this.extractApexExpressions(String(value[attrKey]), result, `${namespace}:${name}.${attrKey.substring(2)}`);
+                } else if (typeof value[attrKey] !== 'object' && !attrKey.includes(':') && !attrKey.startsWith('#')) {
+                  attributes[attrKey] = String(value[attrKey]);
+                  this.extractApexExpressions(String(value[attrKey]), result, `${namespace}:${name}.${attrKey}`);
                 }
               }
 
@@ -118,28 +122,23 @@ export class VfParser {
 
           // Process text content for Apex expressions
           if (key === '#text' && typeof value === 'string') {
-            this.extractApexExpressions(value, result);
-          }
-
-          // Process attribute values for Apex expressions
-          if (typeof value === 'string') {
-            this.extractApexExpressions(value, result);
+            this.extractApexExpressions(value, result, currentContext);
           }
 
           // Recursively traverse
           if (typeof value === 'object' && value !== null) {
             if (Array.isArray(value)) {
               for (const item of value) {
-                traverse(item);
+                traverse(item, newContext);
               }
             } else {
-              traverse(value);
+              traverse(value, newContext);
             }
           }
         }
       };
 
-      traverse(pageTag);
+      traverse(pageTag, 'apex:page');
 
       // Filter unique apex expressions and sort by complexity
       result.apexExpressions = Array.from(new Set(result.apexExpressions))
@@ -151,6 +150,13 @@ export class VfParser {
         });
 
       // Sort components by frequency for better analysis
+      // This is a statistical sort, may not be strictly "unique" components
+      const componentCounts = new Map<string, number>();
+      for (const comp of result.components) {
+        const key = `${comp.namespace}:${comp.name}`;
+        componentCounts.set(key, (componentCounts.get(key) || 0) + 1);
+      }
+
       result.components.sort((a, b) => {
         const aCount = result.components.filter(c => c.name === a.name).length;
         const bCount = result.components.filter(c => c.name === b.name).length;
@@ -158,15 +164,15 @@ export class VfParser {
       });
 
     } catch (err: any) {
-      console.warn('VF Parser: Error parsing Visualforce content, using fallback extraction');
+      console.warn('VF Parser: Error parsing Visualforce content with XML parser, using fallback extraction:', err.message);
       this._extractBasicVfInfo(vfContent, result); // Use the new shared method
-      this.extractApexExpressions(vfContent, result); // Still need to extract expressions
+      this.extractApexExpressions(vfContent, result); // Still need to extract expressions from raw content
     }
 
     return result;
   }
 
-  private static extractApexExpressions(text: string, result: VfParsedInfo): void {
+  private static extractApexExpressions(text: string, result: VfParsedInfo, context: string = 'unknown'): void {
     const expressionRegex = /\{!([^}]+)\}/g;
     let match;
 
@@ -184,7 +190,7 @@ export class VfParser {
         // Simple property or variable
         result.fieldReferences.push({
           expression: exprContent,
-          context: 'unknown'
+          context: context
         });
       }
     }
@@ -200,13 +206,15 @@ export class VfParser {
     ];
 
     for (const { regex, label } of patterns) {
-      const matches = vfContent.match(regex);
-      if (matches) {
-        fragments.push(`${label}: ${matches.join(', ')}`);
+      let match;
+      while ((match = regex.exec(vfContent)) !== null) {
+        if (match[1]) {
+          fragments.push(`${label}: ${match[1]}`);
+        }
       }
     }
 
-    return fragments;
+    return Array.from(new Set(fragments));
   }
 
   // NEW SHARED METHOD
@@ -223,13 +231,40 @@ export class VfParser {
 
     const componentRegex = /<([a-z]+):([a-zA-Z]+)/g;
     let compMatch;
+    const uniqueComponents = new Set<string>(); // Use a set to avoid duplicate component entries for basic info
     while ((compMatch = componentRegex.exec(vfContent)) !== null) {
-      result.components.push({
-        namespace: compMatch[1],
-        name: compMatch[2],
-        attributes: {}
-      });
+      const componentKey = `${compMatch[1]}:${compMatch[2]}`;
+      if (!uniqueComponents.has(componentKey)) {
+        result.components.push({
+          namespace: compMatch[1],
+          name: compMatch[2],
+          attributes: {} // Attributes cannot be extracted with this simple regex
+        });
+        uniqueComponents.add(componentKey);
+      }
     }
     // Note: extractApexExpressions is called separately as it might be needed outside this basic parse
+  }
+
+  // Exposed simplifiedParse method for DocBuilderVf
+  public static simplifiedParse(content: string): VfParsedInfo {
+    const result: VfParsedInfo = {
+      extensionNames: [],
+      components: [],
+      fieldReferences: [],
+      apexExpressions: [],
+      hasForms: false,
+      hasRemoteObjects: false,
+      hasStaticResources: false,
+      templateFragments: [],
+    };
+    VfParser._extractBasicVfInfo(content, result);
+    VfParser.extractApexExpressions(content, result);
+    // Populate other boolean flags based on regex as well
+    result.hasForms = content.includes('<apex:form');
+    result.hasRemoteObjects = content.includes('apex:remoteObjectModel') || content.includes('Visualforce.remoting');
+    result.hasStaticResources = content.includes('$Resource.') || content.includes('<apex:stylesheet') || content.includes('<apex:includeScript');
+    result.templateFragments = VfParser.extractTemplateFragments(content);
+    return result;
   }
 }

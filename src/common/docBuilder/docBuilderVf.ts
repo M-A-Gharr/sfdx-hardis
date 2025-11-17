@@ -139,27 +139,27 @@ export class DocBuilderVf extends DocBuilderRoot {
   private async parseVfContentWithOptimization(content: string): Promise<VfParsedInfo> {
     if (content.length > 100000) { // 100KB threshold
       console.warn(`Large Visualforce page detected (${content.length} bytes), using simplified parsing`);
-      return this.simplifiedParse(content);
+      return VfParser.simplifiedParse(content); // Use the static method directly
     }
     return VfParser.parse(content);
   }
 
-  /** Simplified parsing for very large Visualforce pages */
-  private async simplifiedParse(content: string): Promise<VfParsedInfo> {
-    const result: VfParsedInfo = {
-      extensionNames: [],
-      components: [],
-      fieldReferences: [],
-      apexExpressions: [],
-      hasForms: false,
-      hasRemoteObjects: false,
-      hasStaticResources: false,
-      templateFragments: [],
-    };
-    VfParser._extractBasicVfInfo(content, result); // Call the new shared method
-    VfParser['extractApexExpressions'](content, result); // Also extract expressions
-    return result;
-  }
+  // /** Simplified parsing for very large Visualforce pages */
+  // private async simplifiedParse(content: string): Promise<VfParsedInfo> {
+  //   const result: VfParsedInfo = {
+  //     extensionNames: [],
+  //     components: [],
+  //     fieldReferences: [],
+  //     apexExpressions: [],
+  //     hasForms: false,
+  //     hasRemoteObjects: false,
+  //     hasStaticResources: false,
+  //     templateFragments: [],
+  //   };
+  //   VfParser._extractBasicVfInfo(content, result); // Call the new shared method
+  //   VfParser['extractApexExpressions'](content, result); // Also extract expressions
+  //   return result;
+  // }
 
   /** Helper to find Apex class file */
   private async findApexClassFile(className: string): Promise<string | undefined> {
@@ -205,14 +205,18 @@ export class DocBuilderVf extends DocBuilderRoot {
   /** Get hashes of dependent Apex files for cache invalidation */
   private async getDependentFileHashes(): Promise<string[]> {
     const hashes: string[] = [];
-
-    for (const [className] of this.apexParsedInfoMap) {
-      const apexFile = await this.findApexClassFile(className);
+    hashes.push(this.sourceHash);
+    const controllerNames = [
+      ...(this.vfParsedInfo?.controllerName ? [this.vfParsedInfo.controllerName] : []),
+      ...(this.vfParsedInfo?.extensionNames || [])
+    ];
+    for (const controllerName of controllerNames) {
+      const apexFile = await this.findApexClassFile(controllerName);
       if (apexFile) {
         try {
           const content = await fs.readFile(apexFile, 'utf-8');
           const hash = crypto.createHash('md5').update(content).digest('hex');
-          hashes.push(hash);
+          hashes.push(`${controllerName}:${hash}`); // Include class name for clarity in hash key
         } catch (error) {
           console.warn(`Could not read dependent file ${apexFile} for cache key`);
         }
@@ -278,21 +282,21 @@ export class DocBuilderVf extends DocBuilderRoot {
 
     if (this.config.enablePerformanceMetrics) {
       const metrics = this.calculatePerformanceMetrics();
-      if (metrics.recommendations.length > 0) {
+      if (metrics.recommendations.length > 0 || metrics.apexExpressionCount > 0 || metrics.recommendations.length > 0) {
         sections.push(this.formatPerformanceMetrics(metrics));
       }
     }
 
     if (this.config.enableSecurityAnalysis) {
       const security = this.analyzeSecurityConcerns();
-      if (security.recommendations.length > 0) {
+      if (security.potentialSoqlInjection || security.potentialXss || security.unescapedOutput || security.recommendations.length > 0) {
         sections.push(this.formatSecurityAnalysis(security));
       }
     }
 
     if (this.config.enableBestPractices) {
       const practices = this.analyzeBestPractices();
-      if (practices.recommendations.length > 0) {
+      if (practices.usesViewState || practices.hasJavaScriptRemoting || practices.usesApexActionFunctions || practices.usesCompositionTemplates || practices.recommendations.length > 0) {
         sections.push(this.formatBestPractices(practices));
       }
     }
@@ -321,24 +325,45 @@ export class DocBuilderVf extends DocBuilderRoot {
     };
 
     // Analyze for performance concerns
-    const rowsMatch = this.vfRawContent.match(/rows="(\d+)"/);
-    if (rowsMatch && parseInt(rowsMatch[1]) > 50) {
-      metrics.recommendations.push(`Large data table detected (rows="${rowsMatch[1]}"), consider pagination`);
+    // Check for large data tables using <apex:pageBlockTable> or similar constructs
+    const pageBlockTableRowsMatch = this.vfRawContent.match(/<apex:pageBlockTable[^>]*\s+rows="(\d+)"/i);
+    if (pageBlockTableRowsMatch && parseInt(pageBlockTableRowsMatch[1]) > 50) {
+      metrics.largeDataTables = true;
+      metrics.recommendations.push(`Large data table detected (apex:pageBlockTable rows="${pageBlockTableRowsMatch[1]}"), consider pagination or client-side rendering.`);
+    } else {
+      // Generic check for large number of rows attribute that might apply to apex:repeat or custom tables
+      const genericRowsMatch = this.vfRawContent.match(/rows="(\d+)"/i);
+      if (genericRowsMatch && parseInt(genericRowsMatch[1]) > 50) {
+        // Only add if not already captured by pageBlockTable
+        if (!metrics.largeDataTables) {
+          metrics.largeDataTables = true;
+          metrics.recommendations.push(`Potentially large iteration detected (rows="${genericRowsMatch[1]}"), consider pagination or optimizing data retrieval.`);
+        }
+      }
     }
 
     if (componentCount > 50) {
       metrics.estimatedRenderComplexity = 'high';
-      metrics.recommendations.push('High component count may impact page performance');
+      metrics.recommendations.push('High component count may impact page performance (consider breaking into smaller components or using client-side rendering).');
     } else if (componentCount > 20) {
       metrics.estimatedRenderComplexity = 'medium';
+      metrics.recommendations.push('Moderate component count, monitor page performance.');
     }
 
     if (apexExpressionCount > 30) {
-      metrics.recommendations.push('High number of Apex expressions may impact ViewState size');
+      metrics.recommendations.push('High number of Apex expressions may impact ViewState size and server-side processing time.');
     }
 
-    if (this.vfRawContent.includes('apex:repeat') && componentCount > 10) {
-      metrics.recommendations.push('Consider using apex:pageBlockTable instead of apex:repeat for better performance');
+    if (this.vfParsedInfo?.hasRemoteObjects && (this.vfRawContent.match(/Visualforce.remoting.Manager.invoke/g) || []).length > 5) {
+      metrics.recommendations.push('Multiple Visualforce.remoting calls detected. Ensure appropriate throttling and error handling are in place.');
+    }
+
+    // Check for inline JavaScript or CSS that could be externalized
+    if (this.vfRawContent.includes('<script>') && !this.vfParsedInfo?.hasStaticResources) {
+      metrics.recommendations.push('Inline <script> tags detected. Consider moving JavaScript to static resources for better caching and maintainability.');
+    }
+    if (this.vfRawContent.includes('<style>') && !this.vfParsedInfo?.hasStaticResources) {
+      metrics.recommendations.push('Inline <style> tags detected. Consider moving CSS to static resources for better caching and maintainability.');
     }
 
     return metrics;
@@ -350,7 +375,7 @@ export class DocBuilderVf extends DocBuilderRoot {
       `- **Component Count:** ${metrics.componentCount}`,
       `- **Apex Expressions:** ${metrics.apexExpressionCount}`,
       `- **Estimated Complexity:** ${metrics.estimatedRenderComplexity}`,
-      `- **Large Data Tables:** ${metrics.largeDataTables ? 'Yes' : 'No'}`,
+      `- **Potentially Large Data Tables/Iterations:** ${metrics.largeDataTables ? 'Yes' : 'No'}`,
     ];
 
     if (metrics.recommendations.length > 0) {
@@ -370,27 +395,59 @@ export class DocBuilderVf extends DocBuilderRoot {
       recommendations: []
     };
 
-    // Check for potential SOQL injection
-    if (this.vfRawContent.includes('{!$CurrentPage.parameters}') &&
-      this.vfRawContent.includes('Database.query')) {
+    // Check for potential SOQL injection (simplified check)
+    // A more robust check would require deeper static analysis of Apex controllers
+    const soqlInjectionIndicators = [
+      '{!$CurrentPage.parameters', // User-controlled parameter
+      'Database.query',           // Dynamic SOQL method
+      'SOQL query string here'    // Placeholder for actual SOQL query patterns
+    ];
+
+    if (soqlInjectionIndicators.every(indicator => this.vfRawContent.includes(indicator))) {
       analysis.potentialSoqlInjection = true;
-      analysis.recommendations.push('Potential SOQL injection vulnerability - user input used in dynamic SOQL');
+      analysis.recommendations.push('⚠️ Potential SOQL injection vulnerability: User input from `$CurrentPage.parameters` might be used in dynamic SOQL (`Database.query`). Ensure all user inputs are properly escaped or cast to the expected type.');
+    } else if (this.vfRawContent.includes('Database.query') && this.vfRawContent.includes('{!')) {
+      analysis.recommendations.push('Potential SOQL injection concern: Dynamic SOQL (`Database.query`) used with Visualforce expressions (`{!}`). Verify that all variables passed to `Database.query` are sanitized or safe from user input.');
     }
 
-    // Check for XSS vulnerabilities
-    if (this.vfRawContent.includes('{!') &&
-      this.vfRawContent.includes('escape') === false) {
-      analysis.potentialXss = true;
-      analysis.recommendations.push('Unescaped dynamic content may be vulnerable to XSS');
+    // Check for XSS vulnerabilities (unescaped output)
+    const unescapedOutputRegex = /\{!([^}]+)\}/g;
+    let match;
+    let foundUnescaped = false;
+
+    while ((match = unescapedOutputRegex.exec(this.vfRawContent)) !== null) {
+      const expression = match[1];
+      // Look for expressions that don't seem to have common escaping functions
+      if (!/(HTMLENCODE|JSENCODE|URLENCODE|ESCAPEXML|TEXT|JSONENCODE)\s*\(/i.test(expression)) {
+        // Further check if it's likely user-controlled or complex output
+        if (expression.includes('$CurrentPage.parameters') || expression.includes('controller.') || expression.includes('extension.')) {
+          analysis.potentialXss = true;
+          foundUnescaped = true;
+          analysis.recommendations.push(`⚠️ Potential XSS vulnerability: Unescaped dynamic content \`{!${expression}}\` may allow injection. Consider using \`HTMLENCODE\` for HTML contexts, \`JSENCODE\` for JavaScript contexts, etc.`);
+          break; // One strong finding is enough
+        }
+      }
+    }
+    if (foundUnescaped) {
+      analysis.unescapedOutput = true; // Set general unescaped flag if XSS is found
     }
 
-    // Check for unescaped output
-    if (this.vfRawContent.includes('{!') &&
+    // Additional check for unescaped output (broader than XSS, but related)
+    if (!analysis.unescapedOutput && this.vfRawContent.includes('{!') &&
       !this.vfRawContent.includes('HTMLENCODE') &&
       !this.vfRawContent.includes('JSENCODE') &&
-      !this.vfRawContent.includes('URLENCODE')) {
+      !this.vfRawContent.includes('URLENCODE') &&
+      !this.vfRawContent.includes('ESCAPEXML') &&
+      !this.vfRawContent.includes('TEXT')) {
       analysis.unescapedOutput = true;
-      analysis.recommendations.push('Consider using HTMLENCODE, JSENCODE, or URLENCODE for dynamic content');
+      analysis.recommendations.push('Consider consistently using HTMLENCODE, JSENCODE, URLENCODE, ESCAPEXML, or TEXT functions for all dynamic content to prevent XSS and other output encoding issues.');
+    }
+
+    // Check for `apex:outputText escape="false"`
+    if (this.vfRawContent.includes('<apex:outputText') && this.vfRawContent.includes('escape="false"')) {
+      analysis.potentialXss = true;
+      analysis.unescapedOutput = true;
+      analysis.recommendations.push('⚠️ `apex:outputText escape="false"` found. This is a common XSS vector. Ensure the content being outputted is absolutely trusted or has been sanitized server-side.');
     }
 
     return analysis;
@@ -418,30 +475,53 @@ export class DocBuilderVf extends DocBuilderRoot {
       usesViewState: this.vfRawContent.includes('apex:form'),
       hasJavaScriptRemoting: this.vfRawContent.includes('Visualforce.remoting'),
       usesApexActionFunctions: this.vfRawContent.includes('apex:actionFunction'),
-      usesCompositionTemplates: this.vfRawContent.includes('apex:composition'),
+      usesCompositionTemplates: this.vfRawContent.includes('apex:composition') || this.vfRawContent.includes('apex:insert') || this.vfRawContent.includes('apex:define'),
       recommendations: []
     };
 
     // Generate recommendations
     if (practices.usesViewState && (this.vfParsedInfo?.components.length || 0) > 30) {
-      practices.recommendations.push('Consider optimizing ViewState - page has many components');
+      practices.recommendations.push('Consider optimizing ViewState - page has many components or complex forms. Minimize components in `apex:form` or use `rerender` for partial page updates.');
+    } else if (practices.usesViewState && (this.vfRawContent.match(/<apex:(page|pageBlock|form)/gi) || []).length > 1) {
+      // Multiple forms or nested forms can also indicate viewstate issues
+      practices.recommendations.push('Multiple `apex:form` or nested `apex:form` structures may lead to ViewState issues. Review design for ViewState optimization.');
     }
 
-    if (this.vfRawContent.includes('apex:commandButton')) {
+    if (this.vfRawContent.includes('apex:commandButton') || this.vfRawContent.includes('apex:commandLink')) {
       const hasRerender = this.vfRawContent.includes('rerender="');
       if (!hasRerender) {
-        practices.recommendations.push('Consider adding rerender attributes to command buttons for better UX');
+        practices.recommendations.push('Consider adding `rerender` attributes to `apex:commandButton` or `apex:commandLink` for partial page updates to improve user experience and reduce ViewState size on postbacks.');
       }
     }
 
     const inputTextCount = (this.vfRawContent.match(/apex:inputText/g) || []).length;
     const inputFieldCount = (this.vfRawContent.match(/apex:inputField/g) || []).length;
-    if (inputTextCount > 0 && inputFieldCount === 0) {
-      practices.recommendations.push('Consider using apex:inputField for standard object fields');
+    if (inputTextCount > 0 && inputFieldCount === 0 && this.vfParsedInfo?.controllerName) {
+      practices.recommendations.push('Consider using `apex:inputField` instead of `apex:inputText` for standard object fields. `apex:inputField` automatically handles data types, formatting, and validation.');
     }
 
     if (!practices.usesCompositionTemplates && (this.vfParsedInfo?.components.length || 0) > 10) {
-      practices.recommendations.push('Consider using composition templates for reusable page layouts');
+      practices.recommendations.push('Consider using composition templates (`apex:composition`, `apex:insert`, `apex:define`) for reusable page layouts and to reduce boilerplate code.');
+    }
+
+    if (!practices.hasJavaScriptRemoting && !practices.usesApexActionFunctions && (this.vfRawContent.includes('XMLHttpRequest') || this.vfRawContent.includes('jQuery.ajax'))) {
+      practices.recommendations.push('Page uses custom AJAX calls (e.g., XMLHttpRequest, jQuery.ajax). Consider using `Visualforce.remoting` or `apex:actionFunction` for more integrated and potentially safer AJAX interactions with Apex controllers.');
+    }
+
+    // Check for hardcoded IDs in JavaScript that are prone to breakage
+    if (this.vfRawContent.includes('document.getElementById') || this.vfRawContent.includes('$("#')) {
+      const hardcodedIdRegex = /getElementById\(['"]([a-zA-Z0-9:]+)['"]\)/g;
+      let idMatch;
+      let hardcodedIdsFound = false;
+      while ((idMatch = hardcodedIdRegex.exec(this.vfRawContent)) !== null) {
+        if (!idMatch[1].includes(':')) { // If it doesn't contain a colon, it's likely a hardcoded VF ID
+          hardcodedIdsFound = true;
+          break;
+        }
+      }
+      if (hardcodedIdsFound) {
+        practices.recommendations.push('Avoid hardcoding component IDs in JavaScript (e.g., `document.getElementById("someId")`). Use `$Component` global variable to dynamically generate correct IDs, or assign `styleClass` attributes for robust selectors.');
+      }
     }
 
     return practices;
@@ -470,19 +550,14 @@ export class DocBuilderVf extends DocBuilderRoot {
     let hasReferences = false;
 
     // Link to related Apex classes
-    if (this.apexParsedInfoMap.size > 0) {
-      lines.push('### Related Apex Classes');
-      for (const [className] of this.apexParsedInfoMap) {
-        lines.push(`- [${className}](../apex/${className}.md)`);
-      }
-      lines.push('');
-      hasReferences = true;
-    }
-
-    // Link to related objects if standard controller is used
     if (this.vfParsedInfo?.controllerName) {
-      lines.push('### Standard Objects');
-      lines.push(`- [${this.vfParsedInfo.controllerName}](../objects/${this.vfParsedInfo.controllerName}.md)`);
+      // Assuming standard controllers are often SObject names
+      const sobjectName = this.vfParsedInfo.controllerName.endsWith('__c')
+        ? this.vfParsedInfo.controllerName // Custom object
+        : this.vfParsedInfo.controllerName; // Standard object (e.g., Account, Contact)
+
+      lines.push('### Standard/Custom Object Context');
+      lines.push(`- [${sobjectName}](../objects/${sobjectName}.md)`);
       lines.push('');
       hasReferences = true;
     }
@@ -507,13 +582,18 @@ export class DocBuilderVf extends DocBuilderRoot {
     ];
 
     for (const { pattern, name } of templatePatterns) {
-      const matches = this.vfRawContent.match(new RegExp(pattern, 'g'));
+      const matches = this.vfRawContent.match(new RegExp(pattern, 'gi')); // 'gi' for global and case-insensitive
       if (matches) {
-        fragments.push(`${name}: ${matches.join(', ')}`);
+        matches.forEach(match => {
+          const valueMatch = match.match(pattern);
+          if (valueMatch && valueMatch[1]) {
+            fragments.push(`${name}: \`${valueMatch[1]}\``);
+          }
+        });
       }
     }
 
-    return fragments;
+    return Array.from(new Set(fragments));
   }
 
   /** Prepares the variables object that will be sent to the AI prompt */
@@ -540,7 +620,7 @@ export class DocBuilderVf extends DocBuilderRoot {
       RAW_VF_CODE: this.vfRawContent,
       VF_CONTROLLER: apexControllerInfo,
       VF_COMPONENTS_SUMMARY: this.vfParsedInfo && this.vfParsedInfo.components.length > 0
-        ? `Uses components like ${this.vfParsedInfo.components.map(c => `<${c.namespace}:${c.name}>`).join(', ')}.`
+        ? `Uses ${this.vfParsedInfo.components.length} components, including: ${this.vfParsedInfo.components.slice(0, 5).map(c => `<${c.namespace}:${c.name}>`).join(', ')}.`
         : 'No specific Visualforce components identified.',
       VF_ANALYSIS_SUMMARY: this.generateAnalysisSummary(performanceMetrics, securityAnalysis, bestPractices)
     };
@@ -548,20 +628,28 @@ export class DocBuilderVf extends DocBuilderRoot {
 
   private generateAnalysisSummary(performance: VfPerformanceMetrics, security: VfSecurityAnalysis, practices: VfBestPractices): string {
     const summaries: string[] = [];
-
     if (performance.estimatedRenderComplexity !== 'low') {
-      summaries.push(`Performance: ${performance.estimatedRenderComplexity} complexity`);
+      summaries.push(`Performance: ${performance.estimatedRenderComplexity} render complexity.`);
     }
-
-    if (security.potentialSoqlInjection || security.potentialXss) {
-      summaries.push('Security: Potential concerns detected');
+    if (performance.largeDataTables) {
+      summaries.push('Performance: Potential large data tables/iterations detected.');
     }
-
+    if (performance.recommendations.length > 0) {
+      summaries.push('Performance: Recommendations for improvement are available.');
+    }
+    if (security.potentialSoqlInjection || security.potentialXss || security.unescapedOutput) {
+      summaries.push('Security: Potential vulnerabilities detected.');
+    }
+    if (security.recommendations.length > 0) {
+      summaries.push('Security: Recommendations for addressing concerns are available.');
+    }
     if (practices.recommendations.length > 0) {
-      summaries.push('Best Practices: Improvement opportunities');
+      summaries.push('Best Practices: Opportunities for adherence to best practices identified.');
     }
-
-    return summaries.length > 0 ? summaries.join('; ') : 'No significant issues detected';
+    if (practices.usesViewState) {
+      summaries.push('Best Practices: Uses ViewState (consider optimization).');
+    }
+    return summaries.length > 0 ? summaries.join('; ') : 'No significant issues or recommendations detected in automated analysis.';
   }
 
   /** Build initial markdown lines (before AI description is injected) */
@@ -609,7 +697,7 @@ export class DocBuilderVf extends DocBuilderRoot {
     const lines = await this.buildInitialMarkdownLines();
     const placeholderIndex = lines.indexOf(this.placeholder);
     if (placeholderIndex >= 0) {
-      lines[placeholderIndex] = descriptionContent;
+      lines.splice(placeholderIndex, 1, descriptionContent);
     }
     return lines.join("\n");
   }
@@ -619,13 +707,26 @@ export class DocBuilderVf extends DocBuilderRoot {
     let shortDescription = 'No description available.';
     try {
       const jsonOutputMatch = fullMarkdownContent.match(/\{[\s\S]*\}/);
-      if (jsonOutputMatch) {
+      if (jsonOutputMatch && jsonOutputMatch[1]) {
         const aiJson = JSON.parse(jsonOutputMatch[0]);
         shortDescription = aiJson.shortDescription || shortDescription;
+      } else {
+        // Fallback if no JSON block, maybe AI just returned raw text
+        // Try to extract the first paragraph or line as a short description
+        const firstParagraphMatch = fullMarkdownContent.match(/^(?!#).+?\n\n/s); // First non-heading paragraph
+        if (firstParagraphMatch && firstParagraphMatch[0]) {
+          shortDescription = firstParagraphMatch[0].trim().split('\n')[0].substring(0, 200) + '...';
+        }
       }
     } catch (jsonErr: any) {
-      console.warn(`Failed to parse AI JSON for shortDescription for ${this.metadataName}: ${jsonErr.message}`);
-      shortDescription = 'AI description could not be parsed, using parser fallback.';
+      console.warn(`Failed to parse AI JSON or extract shortDescription for ${this.metadataName}: ${jsonErr.message}`);
+      // If parsing fails, use the fallback text from generateParserOnlyMarkdown as a short description
+      const parserSummaryMatch = this.parserFallbackMarkdown.match(/Automated Parser Summary[\s\S]*?^#+/m);
+      if (parserSummaryMatch) {
+        shortDescription = parserSummaryMatch[0].split('\n')[2].substring(0, 200) + '...'; // Get a snippet from the fallback
+      } else {
+        shortDescription = 'AI description could not be parsed, using parser fallback or generic description.';
+      }
     }
     return shortDescription;
   }
