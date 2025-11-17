@@ -64,12 +64,12 @@ export class DocBuilderVf extends DocBuilderRoot {
 
   constructor(
     public metadataName: string,
-    public vfFilePath: string,
+    public vfFilePath: string, // This is the actual file path
     outputMarkdownRoot: string,
     projectRoot: string,
     config: VfDocBuilderConfig = {}
   ) {
-    // We don't have source or variables ready yet, call super with placeholders
+    // metadataName is the sourceName, vfFilePath is the sourcePath
     super(metadataName, vfFilePath, path.join(outputMarkdownRoot, "vf", `${metadataName}.md`), {});
     this.projectRoot = projectRoot;
     this.vfRawContent = '';
@@ -101,9 +101,8 @@ export class DocBuilderVf extends DocBuilderRoot {
     const mdFilePath = this.outputFile;
     const pageName = this.metadataName;
 
-    // 1. Load Raw VF Content
-    this.vfRawContent = await fs.readFile(this.metadataXml, "utf-8");
-    this.metadataXml = this.vfRawContent;
+    // 1. Load Raw VF Content from the correct path (this.sourcePath is vfFilePath)
+    this.vfRawContent = await fs.readFile(this.vfFilePath, "utf-8");
 
     // 2. Parse Visualforce Page (with size optimization)
     this.vfParsedInfo = await this.parseVfContentWithOptimization(this.vfRawContent);
@@ -143,23 +142,6 @@ export class DocBuilderVf extends DocBuilderRoot {
     }
     return VfParser.parse(content);
   }
-
-  // /** Simplified parsing for very large Visualforce pages */
-  // private async simplifiedParse(content: string): Promise<VfParsedInfo> {
-  //   const result: VfParsedInfo = {
-  //     extensionNames: [],
-  //     components: [],
-  //     fieldReferences: [],
-  //     apexExpressions: [],
-  //     hasForms: false,
-  //     hasRemoteObjects: false,
-  //     hasStaticResources: false,
-  //     templateFragments: [],
-  //   };
-  //   VfParser._extractBasicVfInfo(content, result); // Call the new shared method
-  //   VfParser['extractApexExpressions'](content, result); // Also extract expressions
-  //   return result;
-  // }
 
   /** Helper to find Apex class file */
   private async findApexClassFile(className: string): Promise<string | undefined> {
@@ -205,11 +187,16 @@ export class DocBuilderVf extends DocBuilderRoot {
   /** Get hashes of dependent Apex files for cache invalidation */
   private async getDependentFileHashes(): Promise<string[]> {
     const hashes: string[] = [];
+
+    // Include the hash of the main VF page content
     hashes.push(this.sourceHash);
+
+    // Add hashes of any detected Apex controllers/extensions
     const controllerNames = [
       ...(this.vfParsedInfo?.controllerName ? [this.vfParsedInfo.controllerName] : []),
       ...(this.vfParsedInfo?.extensionNames || [])
     ];
+
     for (const controllerName of controllerNames) {
       const apexFile = await this.findApexClassFile(controllerName);
       if (apexFile) {
@@ -217,8 +204,8 @@ export class DocBuilderVf extends DocBuilderRoot {
           const content = await fs.readFile(apexFile, 'utf-8');
           const hash = crypto.createHash('md5').update(content).digest('hex');
           hashes.push(`${controllerName}:${hash}`); // Include class name for clarity in hash key
-        } catch (error) {
-          console.warn(`Could not read dependent file ${apexFile} for cache key`);
+        } catch (_error: any) { // Renamed 'error' to '_error' and used in log
+          console.warn(`Could not read dependent file ${apexFile} for cache key: ${_error.message}`);
         }
       }
     }
@@ -282,7 +269,8 @@ export class DocBuilderVf extends DocBuilderRoot {
 
     if (this.config.enablePerformanceMetrics) {
       const metrics = this.calculatePerformanceMetrics();
-      if (metrics.recommendations.length > 0 || metrics.apexExpressionCount > 0 || metrics.recommendations.length > 0) {
+      // Only add section if there are meaningful metrics or recommendations
+      if (metrics.componentCount > 0 || metrics.apexExpressionCount > 0 || metrics.recommendations.length > 0) {
         sections.push(this.formatPerformanceMetrics(metrics));
       }
     }
@@ -342,6 +330,7 @@ export class DocBuilderVf extends DocBuilderRoot {
       }
     }
 
+
     if (componentCount > 50) {
       metrics.estimatedRenderComplexity = 'high';
       metrics.recommendations.push('High component count may impact page performance (consider breaking into smaller components or using client-side rendering).');
@@ -354,6 +343,11 @@ export class DocBuilderVf extends DocBuilderRoot {
       metrics.recommendations.push('High number of Apex expressions may impact ViewState size and server-side processing time.');
     }
 
+    if (this.vfRawContent.includes('apex:repeat') && componentCount > 10) {
+      metrics.recommendations.push('Consider using apex:pageBlockTable or custom iteration components instead of apex:repeat for large datasets for better performance and ViewState management.');
+    }
+
+    // Check for excessive use of Visualforce Remoting without throttling
     if (this.vfParsedInfo?.hasRemoteObjects && (this.vfRawContent.match(/Visualforce.remoting.Manager.invoke/g) || []).length > 5) {
       metrics.recommendations.push('Multiple Visualforce.remoting calls detected. Ensure appropriate throttling and error handling are in place.');
     }
@@ -365,6 +359,7 @@ export class DocBuilderVf extends DocBuilderRoot {
     if (this.vfRawContent.includes('<style>') && !this.vfParsedInfo?.hasStaticResources) {
       metrics.recommendations.push('Inline <style> tags detected. Consider moving CSS to static resources for better caching and maintainability.');
     }
+
 
     return metrics;
   }
@@ -410,6 +405,7 @@ export class DocBuilderVf extends DocBuilderRoot {
       analysis.recommendations.push('Potential SOQL injection concern: Dynamic SOQL (`Database.query`) used with Visualforce expressions (`{!}`). Verify that all variables passed to `Database.query` are sanitized or safe from user input.');
     }
 
+
     // Check for XSS vulnerabilities (unescaped output)
     const unescapedOutputRegex = /\{!([^}]+)\}/g;
     let match;
@@ -417,7 +413,7 @@ export class DocBuilderVf extends DocBuilderRoot {
 
     while ((match = unescapedOutputRegex.exec(this.vfRawContent)) !== null) {
       const expression = match[1];
-      // Look for expressions that don't seem to have common escaping functions
+      // cspell:disable-next-line
       if (!/(HTMLENCODE|JSENCODE|URLENCODE|ESCAPEXML|TEXT|JSONENCODE)\s*\(/i.test(expression)) {
         // Further check if it's likely user-controlled or complex output
         if (expression.includes('$CurrentPage.parameters') || expression.includes('controller.') || expression.includes('extension.')) {
@@ -431,6 +427,7 @@ export class DocBuilderVf extends DocBuilderRoot {
     if (foundUnescaped) {
       analysis.unescapedOutput = true; // Set general unescaped flag if XSS is found
     }
+
 
     // Additional check for unescaped output (broader than XSS, but related)
     if (!analysis.unescapedOutput && this.vfRawContent.includes('{!') &&
@@ -450,6 +447,7 @@ export class DocBuilderVf extends DocBuilderRoot {
       analysis.recommendations.push('⚠️ `apex:outputText escape="false"` found. This is a common XSS vector. Ensure the content being outputted is absolutely trusted or has been sanitized server-side.');
     }
 
+
     return analysis;
   }
 
@@ -463,7 +461,7 @@ export class DocBuilderVf extends DocBuilderRoot {
 
     if (analysis.recommendations.length > 0) {
       lines.push('', '**Recommendations:**');
-      analysis.recommendations.forEach(rec => lines.push(`- ${rec}`));
+      lines.push(...analysis.recommendations.map(rec => `- ${rec}`));
     }
 
     return lines.join('\n');
@@ -480,16 +478,21 @@ export class DocBuilderVf extends DocBuilderRoot {
     };
 
     // Generate recommendations
+    // cspell:disable-next-line
     if (practices.usesViewState && (this.vfParsedInfo?.components.length || 0) > 30) {
+      // cspell:disable-next-line
       practices.recommendations.push('Consider optimizing ViewState - page has many components or complex forms. Minimize components in `apex:form` or use `rerender` for partial page updates.');
+      // cspell:disable-next-line
     } else if (practices.usesViewState && (this.vfRawContent.match(/<apex:(page|pageBlock|form)/gi) || []).length > 1) {
       // Multiple forms or nested forms can also indicate viewstate issues
+      // cspell:disable-next-line
       practices.recommendations.push('Multiple `apex:form` or nested `apex:form` structures may lead to ViewState issues. Review design for ViewState optimization.');
     }
 
     if (this.vfRawContent.includes('apex:commandButton') || this.vfRawContent.includes('apex:commandLink')) {
       const hasRerender = this.vfRawContent.includes('rerender="');
       if (!hasRerender) {
+        // cspell:disable-next-line
         practices.recommendations.push('Consider adding `rerender` attributes to `apex:commandButton` or `apex:commandLink` for partial page updates to improve user experience and reduce ViewState size on postbacks.');
       }
     }
@@ -538,7 +541,7 @@ export class DocBuilderVf extends DocBuilderRoot {
 
     if (practices.recommendations.length > 0) {
       lines.push('', '**Recommendations:**');
-      practices.recommendations.forEach(rec => lines.push(`- ${rec}`));
+      lines.push(...practices.recommendations.map(rec => `- ${rec}`));
     }
 
     return lines.join('\n');
@@ -550,6 +553,16 @@ export class DocBuilderVf extends DocBuilderRoot {
     let hasReferences = false;
 
     // Link to related Apex classes
+    if (this.apexParsedInfoMap.size > 0) {
+      lines.push('### Related Apex Classes');
+      for (const [className] of this.apexParsedInfoMap) {
+        lines.push(`- [${className}](../apex/${className}.md)`);
+      }
+      lines.push('');
+      hasReferences = true;
+    }
+
+    // Link to related objects if standard controller is used
     if (this.vfParsedInfo?.controllerName) {
       // Assuming standard controllers are often SObject names
       const sobjectName = this.vfParsedInfo.controllerName.endsWith('__c')
@@ -576,9 +589,9 @@ export class DocBuilderVf extends DocBuilderRoot {
   private detectTemplateFragments(): string[] {
     const fragments: string[] = [];
     const templatePatterns = [
-      { pattern: /<apex:composition\s+template="([^"]+)"/, name: 'Uses template' },
-      { pattern: /<apex:insert\s+name="([^"]+)"/, name: 'Defines insert point' },
-      { pattern: /<apex:define\s+name="([^"]+)"/, name: 'Defines content' }
+      { pattern: /<apex:composition\s+template="([^"]+)"/i, name: 'Uses template' },
+      { pattern: /<apex:insert\s+name="([^"]+)"/i, name: 'Defines insert point' },
+      { pattern: /<apex:define\s+name="([^"]+)"/i, name: 'Defines content for' }
     ];
 
     for (const { pattern, name } of templatePatterns) {
@@ -593,7 +606,7 @@ export class DocBuilderVf extends DocBuilderRoot {
       }
     }
 
-    return Array.from(new Set(fragments));
+    return Array.from(new Set(fragments)); // Ensure unique fragments
   }
 
   /** Prepares the variables object that will be sent to the AI prompt */
@@ -617,7 +630,7 @@ export class DocBuilderVf extends DocBuilderRoot {
     return {
       VF_NAME: this.metadataName,
       VF_CODE: this.vfRawContent,
-      RAW_VF_CODE: this.vfRawContent,
+      RAW_VF_CODE: this.vfRawContent, // Keep for backward compatibility or explicit raw
       VF_CONTROLLER: apexControllerInfo,
       VF_COMPONENTS_SUMMARY: this.vfParsedInfo && this.vfParsedInfo.components.length > 0
         ? `Uses ${this.vfParsedInfo.components.length} components, including: ${this.vfParsedInfo.components.slice(0, 5).map(c => `<${c.namespace}:${c.name}>`).join(', ')}.`
@@ -628,6 +641,7 @@ export class DocBuilderVf extends DocBuilderRoot {
 
   private generateAnalysisSummary(performance: VfPerformanceMetrics, security: VfSecurityAnalysis, practices: VfBestPractices): string {
     const summaries: string[] = [];
+
     if (performance.estimatedRenderComplexity !== 'low') {
       summaries.push(`Performance: ${performance.estimatedRenderComplexity} render complexity.`);
     }
@@ -637,18 +651,24 @@ export class DocBuilderVf extends DocBuilderRoot {
     if (performance.recommendations.length > 0) {
       summaries.push('Performance: Recommendations for improvement are available.');
     }
+
     if (security.potentialSoqlInjection || security.potentialXss || security.unescapedOutput) {
       summaries.push('Security: Potential vulnerabilities detected.');
     }
     if (security.recommendations.length > 0) {
       summaries.push('Security: Recommendations for addressing concerns are available.');
     }
+
     if (practices.recommendations.length > 0) {
       summaries.push('Best Practices: Opportunities for adherence to best practices identified.');
     }
+    // cspell:disable-next-line
     if (practices.usesViewState) {
+      // cspell:disable-next-line
       summaries.push('Best Practices: Uses ViewState (consider optimization).');
     }
+
+
     return summaries.length > 0 ? summaries.join('; ') : 'No significant issues or recommendations detected in automated analysis.';
   }
 
@@ -697,6 +717,7 @@ export class DocBuilderVf extends DocBuilderRoot {
     const lines = await this.buildInitialMarkdownLines();
     const placeholderIndex = lines.indexOf(this.placeholder);
     if (placeholderIndex >= 0) {
+      // Replace the placeholder with the actual description content
       lines.splice(placeholderIndex, 1, descriptionContent);
     }
     return lines.join("\n");
@@ -706,9 +727,10 @@ export class DocBuilderVf extends DocBuilderRoot {
   private extractShortDescription(fullMarkdownContent: string): string {
     let shortDescription = 'No description available.';
     try {
-      const jsonOutputMatch = fullMarkdownContent.match(/\{[\s\S]*\}/);
+      // Attempt to find a JSON block in the markdown content
+      const jsonOutputMatch = fullMarkdownContent.match(/```json\s*(\{[\s\S]*?})\s*```/);
       if (jsonOutputMatch && jsonOutputMatch[1]) {
-        const aiJson = JSON.parse(jsonOutputMatch[0]);
+        const aiJson = JSON.parse(jsonOutputMatch[1]);
         shortDescription = aiJson.shortDescription || shortDescription;
       } else {
         // Fallback if no JSON block, maybe AI just returned raw text
@@ -741,7 +763,7 @@ export class DocBuilderVf extends DocBuilderRoot {
     if (filtered.length === 0) return [];
 
     const lines: string[] = [
-      "## Visualforce Pages",
+      "## Visualforce Pages Overview", // More descriptive heading
       "",
       "| Visualforce Page | Description |",
       "| :--------------- | :---------- |"
