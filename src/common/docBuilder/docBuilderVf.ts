@@ -375,7 +375,7 @@ export class DocBuilderVf extends DocBuilderRoot {
 
     if (metrics.recommendations.length > 0) {
       lines.push('', '**Recommendations:**');
-      metrics.recommendations.forEach(rec => lines.push(`- ${rec}`));
+      lines.push(...metrics.recommendations.map(rec => `- ${rec}`));
     }
 
     return lines.join('\n');
