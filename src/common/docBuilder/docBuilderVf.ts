@@ -136,23 +136,14 @@ export class DocBuilderVf extends DocBuilderRoot {
 
   /** Parse VF content with optimization for large files */
   private async parseVfContentWithOptimization(content: string): Promise<VfParsedInfo> {
-    if (content.length > 100000) { // 100KB threshold
-      console.warn(`Large Visualforce page detected (${content.length} bytes), using simplified parsing`);
-      return VfParser.simplifiedParse(content); // Use the static method directly
-    }
+    if (content.length > 100_000) return VfParser.simplifiedParse(content);
     return VfParser.parse(content);
   }
 
   /** Helper to find Apex class file */
   private async findApexClassFile(className: string): Promise<string | undefined> {
-    const apexFiles = await glob(`**/${className}.cls`, {
-      cwd: this.projectRoot,
-      ignore: GLOB_IGNORE_PATTERNS
-    });
-    if (apexFiles.length > 0) {
-      return path.join(this.projectRoot, apexFiles[0]);
-    }
-    return undefined;
+    const apexFiles = await glob(`**/${className}.cls`, { cwd: this.projectRoot, ignore: GLOB_IGNORE_PATTERNS });
+    return apexFiles.length > 0 ? path.join(this.projectRoot, apexFiles[0]) : undefined;
   }
 
   /** Parses related Apex controllers/extensions with limits */
@@ -202,9 +193,8 @@ export class DocBuilderVf extends DocBuilderRoot {
       if (apexFile) {
         try {
           const content = await fs.readFile(apexFile, 'utf-8');
-          const hash = crypto.createHash('md5').update(content).digest('hex');
-          hashes.push(`${controllerName}:${hash}`); // Include class name for clarity in hash key
-        } catch (_error: any) { // Renamed 'error' to '_error' and used in log
+          hashes.push(`${controllerName}:${crypto.createHash('md5').update(content).digest('hex')}`);
+        } catch (_error: any) {
           console.warn(`Could not read dependent file ${apexFile} for cache key: ${_error.message}`);
         }
       }
@@ -233,69 +223,41 @@ export class DocBuilderVf extends DocBuilderRoot {
   private generateControllerSection(): string {
     if (!this.vfParsedInfo) return '';
 
-    const lines: string[] = [];
-    lines.push(`**Standard Controller:** ${this.vfParsedInfo.controllerName ? `\`${this.vfParsedInfo.controllerName}\`` : 'N/A'}`);
-    lines.push(`**Extensions:** ${this.vfParsedInfo.extensionNames.length > 0 ? this.vfParsedInfo.extensionNames.map(ext => `\`${ext}\``).join(', ') : 'N/A'}`);
-    return lines.join('\n');
+    return [
+      `**Standard Controller:** ${this.vfParsedInfo.controllerName ?? 'N/A'}`,
+      `**Extensions:** ${this.vfParsedInfo.extensionNames.length > 0 ? this.vfParsedInfo.extensionNames.map(e => `\`${e}\``).join(', ') : 'N/A'}`
+    ].join('\n');
   }
 
   private generateComponentsSection(): string {
     if (!this.vfParsedInfo || this.vfParsedInfo.components.length === 0) return '';
 
     const lines: string[] = ['### Identified Visualforce Components'];
-    for (const comp of this.vfParsedInfo.components.slice(0, 20)) { // Limit for large pages
-      lines.push(`- \`<${comp.namespace}:${comp.name}>\` (Attributes: \`${Object.keys(comp.attributes).join(', ')}\`)`);
-    }
-    if (this.vfParsedInfo.components.length > 20) {
+    this.vfParsedInfo.components.slice(0, 20).forEach(comp =>
+      lines.push(`- \`<${comp.namespace}:${comp.name}>\` (Attributes: \`${Object.keys(comp.attributes).join(', ')}\`)`)
+    );
+    if (this.vfParsedInfo.components.length > 20)
       lines.push(`- *... and ${this.vfParsedInfo.components.length - 20} more components*`);
-    }
     return lines.join('\n');
   }
 
   private generateApexSection(): string {
     if (this.apexParsedInfoMap.size === 0) return '';
-
     const lines: string[] = ['### Related Apex Code Details'];
-    for (const [controllerName, apexInfo] of this.apexParsedInfoMap) {
-      lines.push(`#### ${controllerName}`);
-      lines.push(ApexParser.formatForPrompt(apexInfo.methods, apexInfo.properties, apexInfo.className, apexInfo.javaDoc));
-      lines.push('');
-    }
+    for (const [className, apexInfo] of this.apexParsedInfoMap)
+      lines.push(`#### ${className}\n${ApexParser.formatForPrompt(apexInfo.methods, apexInfo.properties, apexInfo.className, apexInfo.javaDoc)}\n`);
     return lines.join('\n');
   }
 
   private generateAnalysisSections(): string {
     const sections: string[] = [];
-
-    if (this.config.enablePerformanceMetrics) {
-      const metrics = this.calculatePerformanceMetrics();
-      // Only add section if there are meaningful metrics or recommendations
-      if (metrics.componentCount > 0 || metrics.apexExpressionCount > 0 || metrics.recommendations.length > 0) {
-        sections.push(this.formatPerformanceMetrics(metrics));
-      }
-    }
-
-    if (this.config.enableSecurityAnalysis) {
-      const security = this.analyzeSecurityConcerns();
-      if (security.potentialSoqlInjection || security.potentialXss || security.unescapedOutput || security.recommendations.length > 0) {
-        sections.push(this.formatSecurityAnalysis(security));
-      }
-    }
-
-    if (this.config.enableBestPractices) {
-      const practices = this.analyzeBestPractices();
-      if (practices.usesViewState || practices.hasJavaScriptRemoting || practices.usesApexActionFunctions || practices.usesCompositionTemplates || practices.recommendations.length > 0) {
-        sections.push(this.formatBestPractices(practices));
-      }
-    }
-
+    if (this.config.enablePerformanceMetrics) sections.push(this.formatPerformanceMetrics(this.calculatePerformanceMetrics()));
+    if (this.config.enableSecurityAnalysis) sections.push(this.formatSecurityAnalysis(this.analyzeSecurityConcerns()));
+    if (this.config.enableBestPractices) sections.push(this.formatBestPractices(this.analyzeBestPractices()));
     if (this.config.enableCrossReferences) {
-      const crossRefs = this.generateCrossReferences();
-      if (crossRefs.length > 0) {
-        sections.push(crossRefs);
-      }
+      const refs = this.generateCrossReferences();
+      if (refs) sections.push(refs);
     }
-
     return sections.join('\n\n');
   }
 
@@ -307,7 +269,7 @@ export class DocBuilderVf extends DocBuilderRoot {
     const metrics: VfPerformanceMetrics = {
       componentCount,
       apexExpressionCount,
-      estimatedRenderComplexity: 'low',
+      estimatedRenderComplexity: componentCount > 50 ? 'high' : componentCount > 20 ? 'medium' : 'low',
       largeDataTables: false,
       recommendations: []
     };
@@ -332,10 +294,8 @@ export class DocBuilderVf extends DocBuilderRoot {
 
 
     if (componentCount > 50) {
-      metrics.estimatedRenderComplexity = 'high';
       metrics.recommendations.push('High component count may impact page performance (consider breaking into smaller components or using client-side rendering).');
     } else if (componentCount > 20) {
-      metrics.estimatedRenderComplexity = 'medium';
       metrics.recommendations.push('Moderate component count, monitor page performance.');
     }
 
@@ -548,14 +508,11 @@ export class DocBuilderVf extends DocBuilderRoot {
     let hasReferences = false;
 
     // Link to related Apex classes
-    if (this.apexParsedInfoMap.size > 0) {
-      lines.push('### Related Apex Classes');
-      for (const [className] of this.apexParsedInfoMap) {
-        lines.push(`- [${className}](../apex/${className}.md)`);
-      }
-      lines.push('');
+    if (this.apexParsedInfoMap.size) {
+      lines.push('### Related Apex Classes', ...Array.from(this.apexParsedInfoMap.keys()).map(c => `- [${c}](../apex/${c}.md)`));
       hasReferences = true;
     }
+
 
     // Link to related objects if standard controller is used
     if (this.vfParsedInfo?.controllerName) {
@@ -572,7 +529,7 @@ export class DocBuilderVf extends DocBuilderRoot {
 
     // Detect template fragments
     const templateFragments = this.detectTemplateFragments();
-    if (templateFragments.length > 0) {
+    if (templateFragments.length) {
       lines.push('### Template Usage');
       templateFragments.forEach(fragment => lines.push(`- ${fragment}`));
       hasReferences = true;
@@ -636,48 +593,14 @@ export class DocBuilderVf extends DocBuilderRoot {
 
   private generateAnalysisSummary(performance: VfPerformanceMetrics, security: VfSecurityAnalysis, practices: VfBestPractices): string {
     const summaries: string[] = [];
-
-    if (performance.estimatedRenderComplexity !== 'low') {
-      summaries.push(`Performance: ${performance.estimatedRenderComplexity} render complexity.`);
-    }
-    if (performance.largeDataTables) {
-      summaries.push('Performance: Potential large data tables/iterations detected.');
-    }
-    if (performance.recommendations.length > 0) {
-      summaries.push('Performance: Recommendations for improvement are available.');
-    }
-
-    if (security.potentialSoqlInjection || security.potentialXss || security.unescapedOutput) {
-      summaries.push('Security: Potential vulnerabilities detected.');
-    }
-    if (security.recommendations.length > 0) {
-      summaries.push('Security: Recommendations for addressing concerns are available.');
-    }
-
-    if (practices.recommendations.length > 0) {
-      summaries.push('Best Practices: Opportunities for adherence to best practices identified.');
-    }
-    if (practices.usesViewState) {
-      summaries.push('Best Practices: Uses ViewState (consider optimization).');
-    }
-
-
-    return summaries.length > 0 ? summaries.join('; ') : 'No significant issues or recommendations detected in automated analysis.';
-  }
-
-  /** Build initial markdown lines (before AI description is injected) */
-  public async buildInitialMarkdownLines(): Promise<string[]> {
-    return [
-      `# ${this.metadataName}`,
-      '',
-      this.placeholder,
-      '',
-      '## Visualforce Source',
-      '```xml',
-      this.vfRawContent,
-      '```',
-      '',
-    ];
+    if (performance.estimatedRenderComplexity !== 'low') summaries.push(`Performance: ${performance.estimatedRenderComplexity} render complexity.`);
+    if (performance.largeDataTables) summaries.push('Performance: Large data tables detected.');
+    if (performance.recommendations.length) summaries.push('Performance: Recommendations available.');
+    if (security.potentialSoqlInjection || security.potentialXss || security.unescapedOutput) summaries.push('Security: Potential issues detected.');
+    if (security.recommendations.length) summaries.push('Security: Recommendations available.');
+    if (practices.recommendations.length) summaries.push('Best Practices: Opportunities for improvement detected.');
+    if (practices.usesViewState) summaries.push('Best Practices: Uses ViewState (consider optimization).');
+    return summaries.join('; ') || 'No significant issues detected.';
   }
 
   /** Main function to generate the AI description with caching and parser fallback */
@@ -688,10 +611,7 @@ export class DocBuilderVf extends DocBuilderRoot {
     try {
       cachedAIResult = await getCache(cacheKey, null);
 
-      if (cachedAIResult) {
-        return this.injectDescriptionIntoSkeleton(cachedAIResult);
-      }
-
+      if (cachedAIResult) return this.injectDescriptionIntoSkeleton(cachedAIResult);
       // If no cache, try AI
       const aiDescription = await super.completeDocWithAiDescription();
       await setCache(cacheKey, aiDescription);
@@ -707,68 +627,58 @@ export class DocBuilderVf extends DocBuilderRoot {
 
   /** Helper to inject a description (AI or fallback) into the markdown skeleton */
   private async injectDescriptionIntoSkeleton(descriptionContent: string): Promise<string> {
-    const lines = await this.buildInitialMarkdownLines();
-    const placeholderIndex = lines.indexOf(this.placeholder);
-    if (placeholderIndex >= 0) {
-      // Replace the placeholder with the actual description content
-      lines.splice(placeholderIndex, 1, descriptionContent);
-    }
-    return lines.join("\n");
+    const lines = [
+      `# ${this.metadataName}`,
+      '',
+      this.placeholder,
+      '',
+      '## Visualforce Source',
+      '```xml',
+      this.vfRawContent,
+      '```',
+      ''
+    ];
+    const idx = lines.indexOf(this.placeholder);
+    if (idx >= 0) lines.splice(idx, 1, descriptionContent);
+    return lines.join('\n');
   }
 
   /** Extracts the shortDescription from AI JSON output or returns a default */
   private extractShortDescription(fullMarkdownContent: string): string {
-    let shortDescription = 'No description available.';
+    let desc = 'No description available.';
     try {
-      // Attempt to find a JSON block in the markdown content
-      const jsonOutputMatch = fullMarkdownContent.match(/```json\s*(\{[\s\S]*?})\s*```/);
-      if (jsonOutputMatch && jsonOutputMatch[1]) {
-        const aiJson = JSON.parse(jsonOutputMatch[1]);
-        shortDescription = aiJson.shortDescription || shortDescription;
-      } else {
-        // Fallback if no JSON block, maybe AI just returned raw text
-        // Try to extract the first paragraph or line as a short description
-        const firstParagraphMatch = fullMarkdownContent.match(/^(?!#).+?\n\n/s); // First non-heading paragraph
-        if (firstParagraphMatch && firstParagraphMatch[0]) {
-          shortDescription = firstParagraphMatch[0].trim().split('\n')[0].substring(0, 200) + '...';
-        }
+      const jsonMatch = fullMarkdownContent.match(/```json\s*(\{[\s\S]*?\})\s*```/);
+      if (jsonMatch) desc = JSON.parse(jsonMatch[1]).shortDescription ?? desc;
+      else {
+        const para = fullMarkdownContent.match(/^(?!#).+?\n\n/s);
+        if (para) desc = para[0].trim().split('\n')[0].slice(0, 200) + '...';
       }
     } catch (jsonErr: any) {
       console.warn(`Failed to parse AI JSON or extract shortDescription for ${this.metadataName}: ${jsonErr.message}`);
       // If parsing fails, use the fallback text from generateParserOnlyMarkdown as a short description
       const parserSummaryMatch = this.parserFallbackMarkdown.match(/Automated Parser Summary[\s\S]*?^#+/m);
       if (parserSummaryMatch) {
-        shortDescription = parserSummaryMatch[0].split('\n')[2].substring(0, 200) + '...'; // Get a snippet from the fallback
+        desc = parserSummaryMatch[0].split('\n')[2].substring(0, 200) + '...'; // Get a snippet from the fallback
       } else {
-        shortDescription = 'AI description could not be parsed, using parser fallback or generic description.';
+        desc = 'AI description could not be parsed, using parser fallback or generic description.';
       }
     }
-    return shortDescription;
+    return desc;
   }
 
   /** Static method for building the index.md for all VF pages */
-  public static buildIndexTable(
-    outputRoot: string,
-    vfDescriptions: VfDocGenerationResult[],
-  ) {
-    const filtered = vfDescriptions;
-
-    if (filtered.length === 0) return [];
-
-    const lines: string[] = [
-      "## Visualforce Pages Overview", // More descriptive heading
+  public static buildIndexTable(outputRoot: string, vfDocs: VfDocGenerationResult[]) {
+    if (!vfDocs.length) return [];
+    const lines = [
+      "## Visualforce Pages Overview",
       "",
       "| Visualforce Page | Description |",
       "| :--------------- | :---------- |"
     ];
-
-    for (const vf of filtered) {
-      const relativePathToIndex = path.relative(path.join(outputRoot, 'vf'), vf.outputPath);
-      const pageCell = `[${vf.name}](${relativePathToIndex})`;
-      const descriptionCell = vf.shortDescription || 'No description available.'
-      lines.push(`| ${pageCell} | ${descriptionCell} |`);
+    for (const vf of vfDocs) {
+      const relPath = path.relative(path.join(outputRoot, 'vf'), vf.outputPath);
+      lines.push(`| [${vf.name}](${relPath}) | ${vf.shortDescription || 'No description'} |`);
     }
-
     lines.push("");
     return lines;
   }

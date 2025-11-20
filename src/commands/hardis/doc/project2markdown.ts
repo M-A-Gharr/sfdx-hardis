@@ -1629,18 +1629,16 @@ ${Project2Markdown.htmlInstructions}
     const projectRoot = this.projectRoot || process.cwd();
     const outputRoot = this.outputMarkdownRoot;
 
-    // Configuration for VF documentation
     const vfConfig: VfDocBuilderConfig = {
       enableSecurityAnalysis: process.env.DISABLE_VF_SECURITY_ANALYSIS !== 'true',
       enablePerformanceMetrics: process.env.DISABLE_VF_PERFORMANCE_METRICS !== 'true',
       enableBestPractices: process.env.DISABLE_VF_BEST_PRACTICES !== 'true',
       enableCrossReferences: true,
-      maxApexClassesToParse: parseInt(process.env.VF_MAX_APEX_CLASSES || '10')
+      maxApexClassesToParse: parseInt(process.env.VF_MAX_APEX_CLASSES || '10', 10)
     };
 
-    // Get all VF files
     const vfFilePaths = await listVfFiles(projectRoot);
-    if (vfFilePaths.length === 0) {
+    if (!vfFilePaths.length) {
       uxLog("log", this, c.yellow("No Visualforce page files found."));
       return;
     }
@@ -1648,73 +1646,76 @@ ${Project2Markdown.htmlInstructions}
     const vfDocResults: VfDocGenerationResult[] = [];
     WebSocketClient.sendProgressStartMessage("Generating Visualforce documentation...", vfFilePaths.length);
 
+    const concurrencyLimit = 5; // Max parallel builds at a time
     let counter = 0;
 
-    for (const vfFilePath of vfFilePaths) {
+    // Helper to run tasks with concurrency control
+    const runWithConcurrency = async <T>(items: T[], handler: (item: T) => Promise<void>, limit: number) => {
+      const executing: Promise<void>[] = [];
+      for (const item of items) {
+        const p = handler(item);
+        executing.push(p);
+
+        if (executing.length >= limit) {
+          await Promise.race(executing).catch(() => { }); // Wait for one to finish
+          // Remove settled promises
+          for (let i = executing.length - 1; i >= 0; i--) {
+            if (executing[i] instanceof Promise) {
+              executing.splice(i, 1);
+            }
+          }
+        }
+      }
+      await Promise.allSettled(executing);
+    };
+
+    await runWithConcurrency(vfFilePaths, async (vfFilePath) => {
       try {
         const pageName = path.basename(vfFilePath, ".page");
-
-        // Create DocBuilderVf instance with enhanced configuration
         const vfBuilder = new DocBuilderVf(pageName, vfFilePath, outputRoot, projectRoot, vfConfig);
-
-        // Delegate the entire generation to DocBuilderVf
         const result = await vfBuilder.build();
-
         vfDocResults.push(result);
 
         counter++;
         WebSocketClient.sendProgressStepMessage(counter, vfFilePaths.length);
-
-        // Add small delay to avoid overwhelming the system with large projects
-        if (vfFilePaths.length > 10) {
-          await new Promise(resolve => setTimeout(resolve, 50));
-        }
       } catch (err: any) {
         uxLog("warning", this, c.yellow(`Failed to generate documentation for ${vfFilePath}: ${err.message}`));
-        if (typeof this.debug === 'function') {
-          this.debug(err.stack);
-        }
+        if (typeof this.debug === 'function') this.debug(err.stack);
       }
-    }
+    }, concurrencyLimit);
 
     WebSocketClient.sendProgressEndMessage();
 
-    // --- Build index.md based on collected results ---
+    // --- Build index.md ---
+    const sortedResults = vfDocResults.sort((a, b) => a.name.localeCompare(b.name));
+    const totalComponents = sortedResults.reduce((sum, r) => {
+      const match = r.markdownContent.match(/Component Count: (\d+)/);
+      return sum + (match ? parseInt(match[1], 10) : 0);
+    }, 0);
+
+    const pagesWithSecurityConcerns = sortedResults.filter(r =>
+      r.markdownContent.includes('Potential SOQL Injection: ⚠️ Yes') ||
+      r.markdownContent.includes('Potential XSS: ⚠️ Yes')
+    ).length;
+
     const indexLines = [
       '# Visualforce Pages',
       '',
-      `*Automatically generated documentation for ${vfDocResults.length} Visualforce pages*`,
+      `*Automatically generated documentation for ${sortedResults.length} Visualforce pages*`,
       '',
+      '## Summary',
+      `- **Total Pages:** ${sortedResults.length}`,
+      `- **Total Components:** ${totalComponents}`,
+      `- **Pages with Security Concerns:** ${pagesWithSecurityConcerns}`,
+      '',
+      ...DocBuilderVf.buildIndexTable(outputRoot, sortedResults),
+      '',
+      this.footer
     ];
 
-    // Sort results by name for consistent menu order
-    const sortedResults = vfDocResults.sort((a, b) => a.name.localeCompare(b.name));
-
-    // Generate summary statistics
-    const totalComponents = sortedResults.reduce((sum, result) => {
-      const componentMatch = result.markdownContent.match(/Component Count: (\d+)/);
-      return sum + (componentMatch ? parseInt(componentMatch[1]) : 0);
-    }, 0);
-
-    const pagesWithSecurityConcerns = sortedResults.filter(result =>
-      result.markdownContent.includes('Potential SOQL Injection: ⚠️ Yes') ||
-      result.markdownContent.includes('Potential XSS: ⚠️ Yes')
-    ).length;
-
-    indexLines.push('## Summary');
-    indexLines.push(`- **Total Pages:** ${sortedResults.length}`);
-    indexLines.push(`- **Total Components:** ${totalComponents}`);
-    indexLines.push(`- **Pages with Security Concerns:** ${pagesWithSecurityConcerns}`);
-    indexLines.push('');
-
-    // Use the static buildIndexTable method from DocBuilderVf
-    const indexTableLines = DocBuilderVf.buildIndexTable(outputRoot, sortedResults);
-    indexLines.push(...indexTableLines);
-
-    indexLines.push('', this.footer);
     await fs.writeFile(path.join(outputRoot, 'vf', 'index.md'), indexLines.join("\n"), 'utf-8');
 
-    // Update class properties with a more structured list for internal use
+    // Update internal properties
     this.vfDescriptions = sortedResults.map(r => ({
       name: r.name,
       description: r.shortDescription,
@@ -1723,36 +1724,31 @@ ${Project2Markdown.htmlInstructions}
         r.markdownContent.includes('Potential XSS: ⚠️ Yes')
     }));
 
-    // For addNavNode, transform the collected results
     const vfForMenuTransformed: Record<string, string> = {};
-    for (const result of sortedResults) {
-      vfForMenuTransformed[result.name] = path.relative(outputRoot, result.outputPath);
-    }
+    for (const r of sortedResults) vfForMenuTransformed[r.name] = path.relative(outputRoot, r.outputPath);
     this.addNavNode("Visualforce Pages", vfForMenuTransformed);
 
     uxLog("success", this, c.green(`Successfully generated documentation for ${sortedResults.length} Visualforce pages.`));
-
-    // Log security summary
-    if (pagesWithSecurityConcerns > 0) {
+    if (pagesWithSecurityConcerns) {
       uxLog("warning", this, c.yellow(`${pagesWithSecurityConcerns} pages have potential security concerns. Review the generated documentation.`));
     }
 
     // --- Optional PDF generation ---
     if (this.withPdf) {
       uxLog("action", this, c.cyan("Generating PDF files for Visualforce documentation..."));
-
-      for (const result of sortedResults) {
-        if (await fs.pathExists(result.outputPath)) {
+      for (const r of sortedResults) {
+        if (await fs.pathExists(r.outputPath)) {
           try {
-            await generatePdfFileFromMarkdown(result.outputPath);
-            uxLog("log", this, c.green(`PDF generated for ${result.name}`));
+            await generatePdfFileFromMarkdown(r.outputPath);
+            uxLog("log", this, c.green(`PDF generated for ${r.name}`));
           } catch (err: any) {
-            uxLog("warning", this, c.yellow(`Failed to generate PDF for ${result.name}: ${err.message}`));
+            uxLog("warning", this, c.yellow(`Failed to generate PDF for ${r.name}: ${err.message}`));
           }
         }
       }
       uxLog("success", this, c.green("All Visualforce PDFs generated successfully."));
     }
   }
+
 
 }

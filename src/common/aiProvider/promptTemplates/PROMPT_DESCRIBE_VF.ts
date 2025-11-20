@@ -31,7 +31,17 @@ const template: PromptTemplateDefinition = {
       name: "VF_ANALYSIS_SUMMARY",
       description: "Automated analysis summary including performance, security, and best practices insights.",
       example: "Performance: medium complexity; Security: Potential concerns detected; Best Practices: Improvement opportunities"
-    }
+    },
+    {
+      name: "VF_PARSED_INFO_JSON",
+      description: "Detailed JSON representation of parsed Visualforce components, inputs, buttons, page blocks, AJAX interactions, and dependencies.",
+      example: "{ \"formCount\": 1, \"inputBindings\": [\"Account.Name\"] }"
+    },
+    {
+      name: "VF_METADATA_JSON",
+      description: "JSON representation of Visualforce page metadata like API version and label.",
+      example: "{ \"apiVersion\": \"58.0\", \"pageLabel\": \"Account View\" }"
+    },
   ],
 
   text: {
@@ -40,7 +50,7 @@ You are a Salesforce developer and documentation specialist.
 Your goal is to summarize the content and behavior of the Visualforce page **"{{VF_NAME}}"**.
 
 Provide a clear, structured explanation suitable for both technical and business stakeholders.
-The description should be comprehensive and use the provided structured Apex controller information.
+The description should be comprehensive and use the provided structured Apex controller information and detailed parsed Visualforce data.
 
 Consider the following analysis insights in your response:
 {{VF_ANALYSIS_SUMMARY}}
@@ -69,8 +79,11 @@ The output **must be valid JSON** with the following structure:
 ### Apex Controller Information
 {{VF_CONTROLLER}}
 
-### Visualforce Components Summary
-{{VF_COMPONENTS_SUMMARY}}
+### Apex Controller Information (for context only, do not repeat in output)
+{{VF_CONTROLLER}}
+
+### Detailed Parsed Visualforce Information (for context only, do not repeat in output)
+{{VF_PARSED_INFO_JSON}}
 
 ### Automated Analysis Summary
 {{VF_ANALYSIS_SUMMARY}}
@@ -104,17 +117,18 @@ The output **must be valid JSON** with the following structure:
     - Identify controller methods used in the markup, and describe what they appear to handle
     - Leverage VF_CONTROLLER info for method signatures and documentation
 
-8.  **Performance Considerations**
-    - Based on the automated analysis, provide performance insights
-    - Suggest optimizations for large data sets, ViewState, or complex components
+8.  **componentSummary**:
+    - Provide a refined, more detailed summary of component usage.
+    - Refer to {{VF_PARSED_INFO_JSON}} to mention specific components like {apex:pageBlock} titles, custom components, etc.
 
-9.  **Security Considerations**
-    - Highlight any security concerns or best practices
-    - Note proper input validation and output encoding
+9.  **Performance Considerations**:
+    - Use {{VF_ANALYSIS_SUMMARY}} and inferred details from {{VF_PARSED_INFO_JSON}}.
 
-10. **Best Practices**
-    - Recommend Visualforce best practices specific to this page
-    - Suggest improvements for maintainability and user experience
+10. **Security Considerations**:
+    - Use {{VF_ANALYSIS_SUMMARY}} and inferred details from {{VF_PARSED_INFO_JSON}}.
+
+11. **Best Practices**:
+    - Use {{VF_ANALYSIS_SUMMARY}} and inferred details from {{VF_PARSED_INFO_JSON}}.
 
 Return only the JSON object.`
   }
